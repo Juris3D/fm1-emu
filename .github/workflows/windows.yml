@@ -1,0 +1,89 @@
+# Windows x64 build of the native emulator (fm1-live, fm1-emu), tested on BOTH boards:
+# the FM-1 (FM-1 SID's committed package, then Felucca from its author's site) and the SMK-37
+# (GHOULBOX from genkigenki's install page, as upstream's SMK-37 page test does).
+# The zip is kept as the run's artifact; a tag win-v<anything> also publishes it as a GitHub Release.
+# Runs weekly too, so an upstream change that breaks Windows shows up even without our own commits.
+# Lives beside upstream's workflows and touches none of their files (see windows/README.md).
+
+name: Windows
+
+on:
+  push:
+    branches: [master, main, windows]
+    tags: ['win-v*']
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Rust (MSVC)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Core tests
+        shell: pwsh
+        run: cargo test --release --locked -p fm1-isa -p fm1-core -p fm1-soc
+
+      - name: Build, speed check (FM-1 SID), package
+        shell: pwsh
+        run: ./windows/build.ps1 -Bench -Package
+
+      - name: Firmware download (both catalogs, Windows paths)
+        shell: pwsh
+        run: node windows/fetch-firmwares.mjs felucca ghoulbox
+
+      - name: FM-1 boots Felucca
+        shell: pwsh
+        run: |
+          $out = & target\release\fm1-live.exe --fwsc firmwares\fm1\felucca.fwsc --bench 3000 2>&1 | Out-String
+          $out
+          if ($out -notmatch 'ms emulated') { throw "FM-1 run failed" }
+
+      - name: SMK-37 boots GHOULBOX on the SMK-37 board
+        shell: pwsh
+        run: |
+          $out = & target\release\fm1-live.exe --fwsc firmwares\smk37\ghoulbox.fwsc --bench 3000 2>&1 | Out-String
+          $out
+          if ($out -notmatch 'ms emulated') { throw "SMK-37 run failed" }
+          # --shot draws the panel it ran on (into work\panel.ppm) and names the SMK-37's pads
+          New-Item -ItemType Directory -Force work | Out-Null
+          $shot = & target\release\fm1-live.exe --fwsc firmwares\smk37\ghoulbox.fwsc --shot 2000 2>&1 | Out-String
+          $shot
+          if ($shot -notmatch 'SMK-37 pads') { throw "the package did not run as the SMK-37 board" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fm1-emu-windows-x64
+          path: dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/win-v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fm1-emu-windows-x64
+          path: dist
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --title "Windows build $GITHUB_REF_NAME" --notes "fm1-emu for Windows 10/11 x64, FM-1 and SMK-37. Unzip, run Start.cmd."
