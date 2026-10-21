@@ -6,8 +6,16 @@
 # Settings (last board and firmware, clock, MIDI) are kept in launcher-settings.json.
 
 $ErrorActionPreference = "Stop"
+# The launcher always sits in windows\ of the emulator's folder (the zip's root or a source checkout).
 $Root = Split-Path -Parent $PSScriptRoot
-if (-not (Test-Path (Join-Path $Root "web\firmwares.json"))) { $Root = $PSScriptRoot }
+if (-not (Test-Path (Join-Path $Root "web\firmwares.json"))) {
+    Write-Host "This folder is not a complete emulator folder: $Root" -ForegroundColor Red
+    Write-Host "It has no web\firmwares.json (the firmware catalogs), so these are the launcher scripts alone."
+    Write-Host "Use the build zip from GitHub (Actions -> Windows -> the run -> Artifacts ->"
+    Write-Host "fm1-emu-windows-x64), unzip it, and start Start.cmd in its top folder."
+    Read-Host "Enter to close" | Out-Null
+    exit 1
+}
 
 $Boards = [ordered]@{
     "fm1"   = @{ Name = "M-VAVE FM-1";  Stock = "FM-1.fwsc" }
@@ -67,7 +75,7 @@ function Invoke-Fetch($fetchArgs) {
         Read-Host "Enter to go back" | Out-Null
         return
     }
-    & node (Join-Path $Root "windows\fetch-firmwares.mjs") @fetchArgs
+    & node (Join-Path $PSScriptRoot "fetch-firmwares.mjs") @fetchArgs
     Read-Host "Enter to go back" | Out-Null
 }
 
