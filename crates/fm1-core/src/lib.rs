@@ -443,29 +443,63 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
+            // careful only for an if-else block's pending skip (code called from its then-part,
+            // say): compiled blocks still run, one at a time, below the then-part's end
             #[cfg(native_jit)]
-            if self.jit_on && !careful {
+            let skip_mode = careful && cfg!(target_arch = "x86_64") && !self.pred_skips.is_empty()
+                && self.hold_irq == 0 && self.rep_end == 0 && self.pair_pending.is_none();
+            #[cfg(native_jit)]
+            if self.jit_on && (!careful || skip_mode) {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
                         self.jit = jit::Jit::new(self.profile).map(Box::new);
                     }
-                    let code = match self.jit.as_mut() {
-                        Some(j) => j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem),
-                        None => None,
+                    // about to compile a block that ends in an if-else block: its then-part along
+                    #[cfg(target_arch = "x86_64")]
+                    let with_then = if self.jit.as_ref().is_some_and(|j| j.compiles_next(id)) { self.native_if_else(bus, start, len, pc) } else { None };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let with_then: Option<Vec<BOp>> = None;
+                    let code = match (self.jit.as_mut(), with_then) {
+                        (Some(j), Some(ops)) => j.entry::<B>(id, ops.as_slice(), pc, &mem),
+                        (Some(j), None) => j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem),
+                        (None, _) => None,
                     };
-                    if let Some((code, _)) = code {
+                    // with a skip pending: a block wholly below every pending then-part end, without
+                    // an if-else of its own, and only it (the limit is its length: a chained body
+                    // finds it spent and leaves at its own pc), so the skip rule is applied as
+                    // `finish` does after each instruction: in the block it never fires, at its
+                    // exit Rust applies it
+                    let code = code.filter(|(_, c)| !skip_mode || (!c.if_else && self.pred_skips.iter().all(|&(te, _)| pc.wrapping_add(c.bytes) < te)));
+                    if let Some((code, covers)) = code {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
+                        // (the budget to the instruction; with a skip pending, this block only)
+                        let cap = if skip_mode { covers.n.min(budget - n) } else { budget - n };
                         // SAFETY: code was compiled for this bus type and memory map
-                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, budget - n) };
+                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, cap) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
+                            if skip_mode {
+                                self.take_skip();
+                            }
                             pc = self.pc;
-                            // (it left between the two instructions of a glued pair)
-                            careful = self.hold_irq != 0;
-                            if !slot.is_null() {
+                            // (it left between the two instructions of a glued pair, or inside an
+                            // if-else block's then-part)
+                            careful = self.hold_irq != 0 || !self.pred_skips.is_empty();
+                            if slot.is_null() {
+                                // left at a pc it only knew at run time (a return, a table
+                                // branch): into the indirect-jump cache once that is compiled
+                                #[cfg(target_arch = "x86_64")]
+                                if !careful {
+                                    if let Some(body) = self.jit_body_at(pc, bus.code_writes().is_some() && !mem.ram_code.is_null()) {
+                                        if let Some(j) = self.jit.as_mut() {
+                                            j.itab_put(pc, body);
+                                        }
+                                    }
+                                }
+                            } else {
                                 // a chainable exit came back: link it once its target is compiled
                                 if let Some(body) = self.jit_body_at(pc, bus.code_writes().is_some() && !mem.ram_code.is_null()) {
                                     // SAFETY: slots are leaked u64s owned by the compiled code
@@ -561,6 +595,15 @@ impl Cpu {
                     careful = still;
                     if stop {
                         return Ok((n, false));
+                    }
+                    // past the careful part, plain ops left in this block: back to the block
+                    // lookup, where they are a block of their own that compiles (else the rest
+                    // of every block after a pair or an if-else block ran here)
+                    #[cfg(all(native_jit, target_arch = "x86_64"))]
+                    if !careful && self.jit_on && pc == next_pc && i + 1 < start + len
+                        && !unsafe { self.bops.get_unchecked(i as usize + 1) }.careful
+                    {
+                        break;
                     }
                 }
                 if pc != next_pc {
@@ -697,10 +740,31 @@ impl Cpu {
         out
     }
 
+    /// A block about to be compiled natively whose plain prefix ends in an if-else block: its ops
+    /// with the then-part's after them (`jit/x64.rs` runs it inline when taken). None: not such a
+    /// block, or a then-part the compiler cannot take whole (it then leaves at a taken one).
+    #[cfg(all(native_jit, target_arch = "x86_64"))]
+    fn native_if_else<B: Bus>(&mut self, bus: &mut B, start: u32, len: u32, pc: u32) -> Option<Vec<BOp>> {
+        let mut ops = self.bops[start as usize..(start + len) as usize].to_vec();
+        if jit::compilable_prefix(&ops) != ops.len() {
+            return None;
+        }
+        let Fast::IfBlk { has_else: true, then_d, .. } = ops[ops.len() - 1].fast else { return None };
+        // (then_part may build one block; never the one that would clear the table the caller's
+        // start indexes: `build_block` clears it past 1 << 22 ops)
+        if self.bops.len() + 64 > 1 << 22 {
+            return None;
+        }
+        let next = pc + ops.iter().map(|o| o.len as u32).sum::<u32>();
+        let then = self.then_part(bus, next, then_d)?;
+        ops.extend(then);
+        Some(ops)
+    }
+
     /// The then-part of an if-else block, `then_d` bytes from `pc`, when it is plain micro-ops
     /// at the start of the block there (no jump, pair, careful op): what the wasm JIT compiles
     /// in line with the if.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", all(native_jit, target_arch = "x86_64")))]
     fn then_part<B: Bus>(&mut self, bus: &mut B, pc: u32, then_d: u16) -> Option<Vec<BOp>> {
         let mut then = Vec::new();
         let mut q = pc;
@@ -798,7 +862,7 @@ impl Cpu {
             let slot = self.fetch_at(bus, p)?;
             let l = self.icache[slot];
             let Some(f) = l.fast else { break };
-            let mut op = BOp { fast: f, len: l.len, careful: l.careful, pair_head: l.pair_head, glue: false };
+            let mut op = BOp { fast: f, len: l.len, careful: l.careful, pair_head: l.pair_head, glue: false, flags_live: l.flags_live };
             let q = p + l.len as u32;
             glued = false;
             // (a head whose flags are read later keeps the careful path: the JITs do not set them)
@@ -957,17 +1021,22 @@ impl Cpu {
     fn sreg_index(n: &str) -> usize {
         match n { "icfg" => 0, "reti" => 1, "retx" => 2, "rete" => 3, "sspn" => 4, "sr4" => 6, _ => 5 }
     }
+    /// icfg as read. Low byte: the ISR priorities in progress (`icfg & 0xff` is the RTOS's "in
+    /// interrupt context" test); bit 9: the global enable `sti` / `cli` set and clear (the SDK's
+    /// cpu_irq_disabled() is `(icfg & 0x300) != 0x300`, bit 8 being the software master enable;
+    /// the stock RTOS asserted in os_mutex_pend while bit 9 read 0). Writes keep their own bit 9
+    /// out of it.
+    #[inline]
+    fn icfg(&self) -> u32 {
+        let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
+        (self.sreg_store[0] & !0x2ff) | active | if self.ie { 0x200 } else { 0 }
+    }
+
     fn sregs(&self, n: &str) -> u32 {
         if n == "cnum" {
             self.core_id
         } else if n == "icfg" {
-            // low byte: the ISR priorities in progress (`icfg & 0xff` is the
-            // RTOS's "in interrupt context" test); bit 9: the global enable `sti` / `cli`
-            // set and clear (the SDK's cpu_irq_disabled() is `(icfg & 0x300) != 0x300`,
-            // bit 8 being the software master enable; the stock RTOS asserted in
-            // os_mutex_pend while bit 9 read 0). Writes keep their own bit 9 out of it.
-            let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
-            (self.sreg_store[0] & !0x2ff) | active | if self.ie { 0x200 } else { 0 }
+            self.icfg()
         } else if n == "psr" {
             (self.sreg_store[5] & !0xf) | self.flags
         } else {
@@ -2859,6 +2928,20 @@ impl Cpu {
         }
     }
 
+    /// The predicated-block skips at the pc an instruction left: at a then-part's end, past its
+    /// else part.
+    #[inline]
+    fn take_skip(&mut self) {
+        let pc = self.pc;
+        if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
+            let (_, ee) = self.pred_skips.remove(i);
+            self.pc = ee;
+        }
+        let pc = self.pc;
+        // a branch out of the construct abandons its pending skip
+        self.pred_skips.retain(|&(te, _)| pc <= te);
+    }
+
     /// Retire an instruction: next pc, predicated-block skips, rep loops.
     #[inline]
     fn finish(&mut self, jumped: Option<u32>, next_pc: u32) {
@@ -2866,14 +2949,7 @@ impl Cpu {
         self.hold_irq = 0;
         self.pc = jumped.unwrap_or(next_pc);
         if !self.pred_skips.is_empty() {
-            let pc = self.pc;
-            if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
-                let (_, ee) = self.pred_skips.remove(i);
-                self.pc = ee;
-            }
-            let pc = self.pc;
-            // a branch out of the construct abandons its pending skip
-            self.pred_skips.retain(|&(te, _)| pc <= te);
+            self.take_skip();
         }
         if self.rep_end != 0 && jumped.is_none() && self.pc == self.rep_end {
             // fell off the end of a rep block: count down, loop or finish
@@ -4767,6 +4843,9 @@ struct BOp {
     /// one after the other they give the pair's result, so the plain path (and compiled code)
     /// runs it like any op. The careful path still runs it as a pair (`pair_head` stays set).
     glue: bool,
+    /// A flag producer whose flags are read later (careful for that too)
+    #[cfg_attr(not(native_jit), allow(dead_code))]
+    flags_live: bool,
 }
 
 impl Fast {
