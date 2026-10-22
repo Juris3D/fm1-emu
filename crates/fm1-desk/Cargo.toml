@@ -1,0 +1,32 @@
+[package]
+name = "fm1-desk"
+description = "FM-1 / SMK-37 Desk: both emulated synths in one window, with a firmware picker, downloads and updates"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "fm1-desk"
+path = "src/main.rs"
+
+[dependencies]
+fm1-core = { path = "../fm1-core" }
+fm1-soc = { path = "../fm1-soc" }
+# (the versions fm1-live uses: one copy of each in a build of both)
+cpal = "0.15"
+midir = "0.10"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+url = "2"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+
+# Its own workspace, as crates/fm1-plugin: the GUI's dependencies stay out of the emulator's
+# builds and CI, and upstream's Cargo.toml / Cargo.lock are not touched.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true

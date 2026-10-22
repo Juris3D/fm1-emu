@@ -9,25 +9,36 @@ package says which board it is for, and the window draws that board's panel.
 ## Use it (the release zip)
 
 1. Unzip anywhere, e.g. `C:\Synths\fm1-emu`.
-2. Install [Node.js](https://nodejs.org) once (`winget install OpenJS.NodeJS.LTS`): the downloader
-   runs the web page's own download code.
-3. Run `Start.cmd`. Press **B** to pick the board, **D** to download its firmwares, then a number
-   to play. **U** updates every firmware of both boards.
+2. Run `Start.cmd`: **FM-1 · SMK-37 Desk** opens, one window for both synths.
+3. The first time, the firmware picker is open: pick the **FM-1** or **SMK-37** tab, then a
+   firmware (**Download & play** fetches it once; after that it is **Play**). Next time the app
+   starts with the firmware you played last.
 
-M-VAVE's own firmwares are not downloaded: get `FM-1.fwsc` or `SMK-37 Pro_016.fwsc` from M-VAVE
-and open it with **O**. (On the SMK-37 it is a MIDI controller: screen and panel work, no sound.)
+While a synth plays, its panel fills the window; the bar at the bottom shows the speed
+(1.00× = keeping up), the clock and the MIDI input. **F1** (or **☰ Firmware**) brings the picker
+over the panel; **Esc** goes back to what plays. In the picker: type to search; "N updates
+available — update all" when the lists have newer versions; **Open own .fwsc…** for M-VAVE's own
+firmwares (`FM-1.fwsc`, `SMK-37 Pro_016.fwsc`, from M-VAVE: on the SMK-37 it is a MIDI
+controller, screen and panel work, no sound).
+
+The firmware lists are upstream's, fetched at start (the built-in ones when offline). Packages go
+to `firmwares\fm1\` and `firmwares\smk37\`; what each firmware saves to its flash (patches,
+settings) to `saves\`, so it is there next time; the app's own settings to `fm1-desk.json`.
 
 | Keys | FM-1 | SMK-37 |
 |---|---|---|
 | `A`…`'`, `W E T Y U O P` | keys | keys (C4–F5) |
 | `Z` / `X` | octave − / + | octave − / + |
 | `Space` / `R` | play / rec | SEQ PLAY / SEQ REC |
-| `1`…`8` | buttons | top row of pads |
+| `1`…`8` (`9 0`) | buttons | top row of pads |
 | `←→` `↓↑` `,.` | encoders | K1, K2, K3 |
-| `Esc` | close | close |
+| `F1` / `Esc` | picker / back | picker / back |
 
-The mouse works on the drawn panel. Any MIDI keyboard plays it (**M** picks the input).
-If the sound crackles, the CPU can't keep up: **C** lowers the clock (try 160, then 120).
+The mouse works on the drawn panel: click or drag across keys, drag or scroll knobs, drag faders
+and wheels. Any MIDI keyboard plays it. If the sound crackles, the CPU can't keep up: lower the
+clock in the bottom bar (try 160, then 120).
+
+The console launcher of before is still there: `windows\Console launcher.cmd` (needs Node.js).
 
 ## Build from source
 
@@ -37,7 +48,7 @@ offers), then in the repository:
 ```
 powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Bench            build + speed check
 powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Package          + dist\fm1-emu-<ver>-windows-x64.zip
-windows\Start.cmd                                                             the launcher, on target\release
+windows\Start.cmd                                                             the app (crates\fm1-desk\target\release)
 ```
 
 GitHub builds the same zip on every push (`.github/workflows/windows.yml`: Actions → Windows →

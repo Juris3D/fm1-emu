@@ -1,13 +1,17 @@
 # FM-1 / SMK-37 desktop app: design notes
 
+**State (23 Oct 2026):** first version built: `crates/fm1-desk` (FM-1 · SMK-37 Desk): play mode,
+picker over the panel (tabs, search, statuses, downloads, update all, own .fwsc), lists fetched
+from upstream with the built-in ones as fallback, flash saved per firmware, window fitted to
+each board's panel. Still to do: the app's own update check, and the "big screen" layout.
+
 The goal: one Windows `.exe` for both boards, with no Node.js and no console. The emulator is already one
 program for both: a package says which board it runs on, and the panel follows it.
 
 ## Two modes, one window
 
 - **Play mode.** The synth panel alone, nothing else competing for space.
-- **Picker mode.** Opens over the panel, full window, with the panel dimmed behind (a button, or F1 /
-  Tab). Browsing and playing are separate moments, so the picker gets room for readable descriptions.
+- **Picker mode.** Opens over the panel, full window, with the panel dimmed behind (a button, or F1). Browsing and playing are separate moments, so the picker gets room for readable descriptions.
   - Tabs: **FM-1 | SMK-37**; a search box (80+ firmwares).
   - Per firmware: name, version, author, the full description, and a status: downloaded / update
     available / not downloaded.

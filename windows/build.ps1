@@ -1,4 +1,4 @@
-# Build fm1-live.exe and fm1-emu.exe from source on Windows, and optionally the release zip.
+# Build fm1-desk.exe (the app), fm1-live.exe and fm1-emu.exe from source on Windows, and optionally the zip.
 #   powershell -ExecutionPolicy Bypass -File windows\build.ps1            build
 #   powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Package   build + dist\fm1-emu-windows-x64.zip
 #   ... -Bench                                                            build + speed check (FM-1 SID)
@@ -15,6 +15,10 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 cargo build --release --locked -p fm1-live -p fm1-emu
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 & target\release\fm1-live.exe --version
+# the app: its own workspace (crates/fm1-desk), its own target folder
+cargo build --release --locked --manifest-path crates\fm1-desk\Cargo.toml
+if ($LASTEXITCODE -ne 0) { throw "cargo build (fm1-desk) failed" }
+if (-not (Test-Path crates\fm1-desk\target\release\fm1-desk.exe)) { throw "no fm1-desk.exe" }
 
 if ($Bench) {
     # FM-1 SID's package is in the repository: no download needed. "x real time" over 1.0 = keeps up.
@@ -26,10 +30,10 @@ if ($Package) {
     $stage = Join-Path $Root "dist\stage"
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path "$stage\bin", "$stage\web\smk37", "$stage\windows", "$stage\examples" | Out-Null
-    Copy-Item target\release\fm1-live.exe, target\release\fm1-emu.exe "$stage\bin\"
+    Copy-Item target\release\fm1-live.exe, target\release\fm1-emu.exe, crates\fm1-desk\target\release\fm1-desk.exe "$stage\bin\"
     Copy-Item web\fwsc.js, web\firmwares.json "$stage\web\"
     Copy-Item web\smk37\firmwares.json "$stage\web\smk37\"
-    Copy-Item windows\launcher.ps1, windows\fetch-firmwares.mjs, windows\README.md "$stage\windows\"
+    Copy-Item windows\launcher.ps1, windows\fetch-firmwares.mjs, windows\README.md, "windows\Console launcher.cmd" "$stage\windows\"
     Copy-Item windows\Start.cmd "$stage\"
     Copy-Item fm1-sid\web\sidplayer.fwsc "$stage\examples\fm1-sid.fwsc"
     Copy-Item LICENSE "$stage\LICENSE.txt"
