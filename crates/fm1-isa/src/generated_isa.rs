@@ -39754,7 +39754,7 @@ pub static ISA: &[IsaEntry] = &[
         syntax: "sp = R",
         len: 4,
         count: 8,
-        mask: 0x000000008fffffff_u64,
+        mask: 0x000000000fffffff_u64,
         match_: 0x000000000e80e064_u64,
         group: "misc",
         alt: &[
@@ -39765,7 +39765,7 @@ pub static ISA: &[IsaEntry] = &[
             0x00007e80e064_u64,
         ],
         slots: &[
-            SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 28), (30, 30), (29, 29)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 },
         ],
     },
     IsaEntry {
@@ -41300,7 +41300,9 @@ pub static ISA: &[IsaEntry] = &[
         syntax: "R = R & ~(#i << R) #",
         len: 4,
         count: 2,
-        mask: 0x00000000cf9fffff_u64,
+        // (the pair-head twin of r_mov_r_i_lsl_r_l4, every register: the corpus fit had taken
+        // only its two samples' bits; DUELL 0.2.20 runs `94 f1 13 13` when HOME is pressed)
+        mask: 0x00000000000fffff_u64,
         match_: 0x000000000003f194_u64,
         group: "misc",
         alt: &[
@@ -41308,12 +41310,13 @@ pub static ISA: &[IsaEntry] = &[
         samples: &[
             0x00000043f194_u64,
             0x00003023f194_u64,
+            0x00001313f194_u64,
         ],
         slots: &[
-            SlotSpec { kind: SlotKind::Imm, pieces: &[(29, 29), (21, 21)], mult: 0, adj: 0, hi: 0, lo: 0 },
-            SlotSpec { kind: SlotKind::Scaled, pieces: &[(21, 22)], mult: 2, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(20, 23)], mult: 0, adj: 0, hi: 0, lo: 0 },
             SlotSpec { kind: SlotKind::Const, pieces: &[], mult: 0, adj: 1, hi: 0, lo: 0 },
-            SlotSpec { kind: SlotKind::Const, pieces: &[], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 27)], mult: 0, adj: 0, hi: 0, lo: 0 },
         ],
     },
     IsaEntry {
@@ -64930,7 +64933,7 @@ pub static ISA: &[IsaEntry] = &[
         syntax: "[R+#i] &= ~R",
         len: 4,
         count: 64,
-        mask: 0x000000000883ffff_u64,
+        mask: 0x000000000083ffff_u64,
         match_: 0x000000000003e864_u64,
         group: "misc",
         alt: &[
@@ -64965,7 +64968,7 @@ pub static ISA: &[IsaEntry] = &[
         slots: &[
             SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 },
             SlotSpec { kind: SlotKind::Scaled, pieces: &[(18, 22)], mult: 4, adj: 0, hi: 0, lo: 0 },
-            SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 26)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 27)], mult: 0, adj: 0, hi: 0, lo: 0 },
         ],
     },
     IsaEntry {

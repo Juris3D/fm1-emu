@@ -30,6 +30,7 @@ pub mod flaky;
 pub mod fwsc;
 mod lcd;
 pub mod machine;
+pub mod p33;
 pub mod periph;
 mod ram;
 pub mod smk;
@@ -59,6 +60,7 @@ pub struct UnknownAccess {
     pub value: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Region {
     Xip,
     Ram,
@@ -73,6 +75,8 @@ enum Region {
     Uart1,
     Adc,
     Ana,
+    /// The power domain's register port (p33.rs).
+    P33,
     Bt,
     Spi2,
     Crc,
@@ -87,6 +91,43 @@ enum Region {
     Sram2,
     Unknown,
 }
+
+// The peripheral window, by table: `Soc::region` was a chain of some 30 compares with P33 near
+// its end, and OberVave, ZP-12 and FM1-DOOM touch P33 tens of millions of times a second (a
+// watchdog kick per round of their main loop; a quarter of FM1-DOOM's time was the chain).
+const SFR_LO: u32 = 0x10000;
+const SFR_HI: u32 = 0x14000;
+
+/// The region of an address in the peripheral window (8-byte cells: every block there starts
+/// and ends on one; `sfr_table_matches_ranges` checks it).
+const fn sfr_region(a: u32) -> Region {
+    match a {
+        0x12e00..=0x12e3f => Region::Alnk,
+        0x10000..=0x1001f => Region::Clk,
+        0x10400..=0x1091f => Region::Timer,
+        0x11c00..=0x11c1f => Region::Spi0,
+        0x11d00..=0x11d1f => Region::Spi1,
+        0x11e00..=0x11e1f => Region::Spi2,
+        0x11800..=0x1183f => Region::Usb,
+        0x12100..=0x1212f => Region::Uart1,
+        0x13100..=0x1311f => Region::Adc,
+        0x13500..=0x1350f => Region::Crc,
+        0x13b00..=0x13b07 => Region::Rand,
+        0x11900..=0x119ff => Region::Ana,
+        0x13e08..=0x13e0f => Region::P33,
+        _ => Region::Unknown,
+    }
+}
+
+static SFR_MAP: [Region; ((SFR_HI - SFR_LO) / 8) as usize] = {
+    let mut t = [Region::Unknown; ((SFR_HI - SFR_LO) / 8) as usize];
+    let mut i = 0;
+    while i < t.len() {
+        t[i] = sfr_region(SFR_LO + 8 * i as u32);
+        i += 1;
+    }
+    t
+};
 
 /// The SoC bus: XIP flash + data RAM + modeled peripherals + a logged stub.
 /// A cheap hasher for register addresses (the SoC's register map): `std`'s SipHash cost the
@@ -157,9 +198,14 @@ pub struct Soc {
     /// the updater gives every firmware: April OS keeps its samples at flash 0x74000, read
     /// through XIP 0x02070000, and waits at boot until it finds them or a blank chip's 0xff).
     pub xip_flash: bool,
-    /// cpu0 set 0x10008 bit 3 (core 1's release); latched until the runner starts cpu1, as
-    /// firmwares hold the bit only while they wait for core 1 to report in.
+    /// cpu0 released core 1: 0x10008 bit 3 (the stock firmware), or the first `|= 8` (run) on
+    /// core 1's CON register 0x1EEE004 (M-VAVE's FM1 Open, after the newer AC79 SDK); latched
+    /// until the runner starts cpu1, as firmwares hold the bit only while they wait for core 1
+    /// to report in.
     pub cpu1_release: bool,
+    /// core 1 was released once: a later run on 0x1EEE004 is the stock IPC's resume after a
+    /// pause, not a release.
+    cpu1_released_once: bool,
     /// FM1_AUDIO_TRACE: log each audio half-buffer (debugging the DMA's pace).
     audio_trace: bool,
     /// The CRC-16 unit's register (0x13504).
@@ -173,6 +219,8 @@ pub struct Soc {
     unknown_log: Vec<UnknownAccess>,
     /// `--flaky-core1`: core 1's RAM loads misread now and then (flaky.rs); None = a good unit.
     pub flaky_core1: Option<flaky::FlakyCore1>,
+    /// The power domain's analog registers.
+    pub p33: p33::P33,
 }
 
 fn dbg_line(addr: u32) -> &'static str {
@@ -202,6 +250,22 @@ impl Soc {
         }
     }
 
+    /// A saved flash chip in place of the booted one (fm1-live --flash): each 4 KiB sector that
+    /// differs goes to the chip and, as the firmware's own erases and programs do, through to
+    /// the XIP window (whose installed copy would otherwise still show the package's bytes).
+    pub fn restore_flash(&mut self, image: &[u8]) {
+        let n = image.len().min(spiflash::FLASH_SIZE);
+        for at in (0..n).step_by(4096) {
+            let end = (at + 4096).min(n);
+            if self.flash.mem[at..end] != image[at..end] {
+                self.flash.mem[at..end].copy_from_slice(&image[at..end]);
+                self.flash.changed = Some((at, end));
+                self.sync_xip();
+                self.flash.revision = self.flash.revision.wrapping_add(1);
+            }
+        }
+    }
+
     /// `ram_size` in bytes; `xip` = the app binary mapped at XIP_BASE.
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
         Self {
@@ -222,11 +286,13 @@ impl Soc {
             crc: 0,
             rand: 0x9e37_79b9_7f4a_7c15,
             cpu1_release: false,
+            cpu1_released_once: false,
             audio_trace: std::env::var_os("FM1_AUDIO_TRACE").is_some(),
             xip_flash: true,
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
             unknown_log: Vec::new(),
             flaky_core1: None,
+            p33: Default::default(),
         }
     }
 
@@ -322,7 +388,26 @@ impl Soc {
         }
     }
 
+    #[inline(always)]
     fn region(&self, addr: u32) -> Region {
+        let o = addr.wrapping_sub(SFR_LO);
+        if o < SFR_HI - SFR_LO {
+            return SFR_MAP[(o >> 3) as usize];
+        }
+        // the rest below 0x0100_0000: no memory region starts there (RAM, SRAM2, XIP, the overlay
+        // and the interrupt controllers all lie above), so the order below is unchanged for them
+        if addr < 0x0100_0000 {
+            return match addr {
+                0x50000..=0x501ff => Region::Gpio,
+                0x51000..=0x5103f => Region::Iomap,
+                // the second USB PHY (the SMK-37's LED commons at 0x16A0C, its pads used as GPIO;
+                // its stock firmware powers the PHY up at boot and waits for 0x16800 bit 4). The
+                // FM-1's stock firmware touches the block too, as before: unknown.
+                0x16800..=0x16a1f if self.board == Board::Smk37 => Region::Usb,
+                0x20000..=0x2ffff => Region::Bt,
+                _ => Region::Unknown,
+            };
+        }
         match addr {
             a if a >= XIP_BASE && (a - XIP_BASE) < self.xip.len() as u32 => Region::Xip,
             // past the loaded image the XIP window still shows the flash chip (the stock
@@ -333,25 +418,6 @@ impl Soc {
             a if a >= SRAM2_BASE && (a - SRAM2_BASE) < self.sram2.len() as u32 => Region::Sram2,
             0x1eee000..=0x1eee0ff => Region::Irqc,
             0x1eef000..=0x1eef3ff => Region::Irqc2,
-            0x12e00..=0x12e3f => Region::Alnk,
-            0x50000..=0x501ff => Region::Gpio,
-            0x51000..=0x5103f => Region::Iomap,
-            0x10000..=0x1001f => Region::Clk,
-            0x10400..=0x1091f => Region::Timer,
-            0x11c00..=0x11c1f => Region::Spi0,
-            0x11d00..=0x11d1f => Region::Spi1,
-            0x11e00..=0x11e1f => Region::Spi2,
-            0x11800..=0x1183f => Region::Usb,
-            // the second USB PHY (the SMK-37's LED commons at 0x16A0C, its pads used as GPIO; its
-            // stock firmware powers the PHY up at boot and waits for 0x16800 bit 4). The FM-1's
-            // stock firmware touches the block too, as before: unknown.
-            0x16800..=0x16a1f if self.board == Board::Smk37 => Region::Usb,
-            0x12100..=0x1212f => Region::Uart1,
-            0x13100..=0x1311f => Region::Adc,
-            0x13500..=0x1350f => Region::Crc,
-            0x13b00..=0x13b07 => Region::Rand,
-            0x11900..=0x119ff => Region::Ana,
-            0x20000..=0x2ffff => Region::Bt,
             0x1eee240..=0x1eee24f => Region::Dbg,
             _ => Region::Unknown,
         }
@@ -697,6 +763,7 @@ impl Soc {
                 self.rand = x;
                 (if addr == 0x13b00 { x } else { x >> 32 }) as u32
             }
+            Region::P33 => self.p33.read(addr),
             Region::Unknown => {
                 self.log_unknown(addr, 4, false, 0);
                 0
@@ -739,6 +806,13 @@ impl Soc {
                         self.paused[core] = true;
                     } else if value & 8 != 0 {
                         self.paused[core] = false;
+                        if core == 1 && !self.cpu1_released_once {
+                            // M-VAVE's FM1 Open SDK releases core 1 here (C1_CON |= 8), not at 0x10008
+                            // (once: the stock firmware's IPC resumes core 1 the same way)
+                            self.cpu1_released_once = true;
+                            self.cpu1_release = true;
+                            self.periph.next_due = 0;
+                        }
                     }
                     self.sfr_set(addr, value & !0x14);
                 } else {
@@ -769,6 +843,7 @@ impl Soc {
             }
             Region::Iomap => self.sfr_set(addr, value),
             Region::Ana => self.sfr_set(addr, value),
+            Region::P33 => self.p33.write(addr, value),
             Region::Bt => {
                 if addr == 0x2fc44 {
                     self.bt_window = value;
@@ -776,6 +851,7 @@ impl Soc {
             }
             Region::Clk => {
                 if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 {
+                    self.cpu1_released_once = true;
                     self.cpu1_release = true;
                     self.periph.next_due = 0; // the runner looks at it before the next instruction
                 }
@@ -906,6 +982,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sfr_table_matches_ranges() {
+        for a in SFR_LO..SFR_HI {
+            assert_eq!(SFR_MAP[((a - SFR_LO) >> 3) as usize], sfr_region(a), "{a:#x}");
+        }
+    }
+
+    /// `region` as the chain of compares it was: the table and the early return below
+    /// 0x0100_0000 must give the same answer for every peripheral address, on both boards.
+    fn region_chain(soc: &Soc, addr: u32) -> Region {
+        match addr {
+            0x1eee000..=0x1eee0ff => Region::Irqc,
+            0x1eef000..=0x1eef3ff => Region::Irqc2,
+            0x12e00..=0x12e3f => Region::Alnk,
+            0x50000..=0x501ff => Region::Gpio,
+            0x51000..=0x5103f => Region::Iomap,
+            0x10000..=0x1001f => Region::Clk,
+            0x10400..=0x1091f => Region::Timer,
+            0x11c00..=0x11c1f => Region::Spi0,
+            0x11d00..=0x11d1f => Region::Spi1,
+            0x11e00..=0x11e1f => Region::Spi2,
+            0x11800..=0x1183f => Region::Usb,
+            0x16800..=0x16a1f if soc.board == Board::Smk37 => Region::Usb,
+            0x12100..=0x1212f => Region::Uart1,
+            0x13100..=0x1311f => Region::Adc,
+            0x13500..=0x1350f => Region::Crc,
+            0x13b00..=0x13b07 => Region::Rand,
+            0x11900..=0x119ff => Region::Ana,
+            0x13e08..=0x13e0f => Region::P33,
+            0x20000..=0x2ffff => Region::Bt,
+            0x1eee240..=0x1eee24f => Region::Dbg,
+            _ => Region::Unknown,
+        }
+    }
+
+    #[test]
+    fn region_by_table_matches_the_chain() {
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        for board in [Board::Fm1, Board::Smk37] {
+            soc.board = board;
+            for a in (0..0x60000).chain(0x0100_0000..0x0100_0100) {
+                assert_eq!(soc.region(a), region_chain(&soc, a), "{a:#x} on {board:?}");
+            }
+        }
+    }
+
+    #[test]
     fn flash_writes_show_through_xip() {
         // a booted package's window (0x80000 bytes, flash 0x4000..0x84000): erasing the sector
         // at flash 0x74000 and programming two bytes there reads back through XIP 0x02070000,
@@ -923,5 +1045,41 @@ mod tests {
         assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the next sector as installed");
         assert_eq!(soc.flash.revision, 2, "erase and program persist even after XIP consumes changed");
         assert!(!soc.flash.busy());
+    }
+
+    #[test]
+    fn a_restored_flash_shows_through_xip() {
+        // the installed window (xip) holds 0xaa; the saved chip has new bytes at 0x74000 (in the
+        // window) and 0xf0000 (past it): both reach the chip, the first also the window
+        let mut soc = Soc::new(1 << 16, vec![0xaa; 0x80000]);
+        soc.xip_flash = true;
+        let mut image = soc.flash.mem.clone();
+        image[0x74000..0x74004].copy_from_slice(&[0x46, 0x53, 0x4d, 0x36]);
+        image[0xf0000] = 0x12;
+        let rev = soc.flash.revision;
+        soc.restore_flash(&image);
+        assert_eq!(soc.flash.mem, image);
+        assert_eq!(soc.read32(XIP_BASE + (0x74000 - XIP_FLASH_OFFSET) as u32), 0x364d_5346);
+        assert_eq!(soc.read32(XIP_BASE + (0x75000 - XIP_FLASH_OFFSET) as u32), 0xaaaa_aaaa, "an unchanged sector keeps the installed bytes");
+        assert_eq!(soc.flash.revision, rev.wrapping_add(2));
+    }
+
+    #[test]
+    fn a_power_cut_stops_half_way_through_an_op() {
+        // cut at op 2 (the page program): erased, two of the four bytes programmed, then nothing
+        let mut soc = Soc::new(1 << 16, vec![0xaa; 0x80000]);
+        soc.flash.cut_at = Some(2);
+        for cmd in [&[0x06][..], &[0x20, 0x07, 0x40, 0x00], &[0x06], &[0x02, 0x07, 0x40, 0x00, 0x12, 0x34, 0x56, 0x78],
+                    &[0x06], &[0x20, 0x07, 0x50, 0x00]] {
+            soc.write32(0x500c0, 0);
+            for &b in cmd {
+                soc.write32(spiflash::SPI0_BASE + 8, b as u32);
+            }
+            soc.write32(0x500c0, 1);
+        }
+        assert_eq!(soc.read32(0x0207_0000), 0xffff_3412, "the first half of the page program");
+        assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the erase after the cut never happened");
+        assert_eq!(soc.flash.ops, 3);
+        assert!(soc.flash.cut());
     }
 }

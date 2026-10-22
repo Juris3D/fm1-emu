@@ -6815,12 +6815,12 @@ instructions:
   - name: r_i_and_r_l4
     syntax: "[R+#i] &= ~R"
     len: 4
-    mask: "0883ffff"
+    mask: "0083ffff"
     match: "0003e864"
     group: store
     fields:
       f0: [18, 22]
-      f1: [24, 26]
+      f1: [24, 27]
       f2: [28, 31]
     count: 64
     samples: ["64e80301", "64e80302", "64e80303", "64e80310", "64e80312", "64e80323", "64e80356", "64e80364", "64e80365", "64e80367", "64e803c6", "64e80b01", "64e80b03", "64e80be0", "64e80f01", "64e80f02", "64e80fe0", "64e81302", "64e81312", "64e81702", "64e81712", "64e81732", "64e81f45", "64e82303", "64e85ba0"]
@@ -13848,11 +13848,11 @@ instructions:
   - name: sp_mov_r_3
     syntax: "sp = R"
     len: 4
-    mask: "8fffffff"
+    mask: "0fffffff"
     match: "0e80e064"
     group: alu
     fields:
-      f0: [28, 30]
+      f0: [28, 31]
     count: 8
     samples: ["64e0800e", "64e0806e", "64e0807e"]
     status: auto
@@ -23696,17 +23696,18 @@ instructions:
     count: 2
     samples: ["eeee8880", "eeeee880"]
     status: auto
+  # the pair-head twin of r_mov_r_i_lsl_r_l4, every register (the corpus fit took only its two
+  # samples' bits; DUELL 0.2.20 runs `94 f1 13 13` when HOME is pressed)
   - name: r_mov_r_i_lsl_r_8
     syntax: "R = R & ~(#i << R) #"
     len: 4
-    mask: "cf9fffff"
+    mask: "000fffff"
     match: "0003f194"
     group: alu_imm
     fields:
-      f0: [21, 22]
-      f1: [28, 29]
+      f0: [20, 31]
     count: 2
-    samples: ["94f12330", "94f14300"]
+    samples: ["94f12330", "94f14300", "94f11313"]
     status: auto
   - name: r1_r0_sub_h_r_add_i_r_u_l4
     syntax: "r1_r0 -= h[R ++= -#i]*R (u)"

@@ -223,8 +223,11 @@ pub fn run_cpu1(c1: &mut Cpu, soc: &mut Soc, cycles: u64) -> Result<(), String> 
                 }
             }
         }
-        let chunk = if probing > 0 { 1 } else { left.min(256) };
-        let mut bus = Core1Bus { soc: &mut *soc, budget: chunk.max(64) + 1 };
+        let busy = if probing > 0 { 0 } else { left.min(256) };
+        let mut bus = Core1Bus { soc: &mut *soc, budget: busy.max(64) + 1 };
+        // (probing: the block at pc, to its last instruction or to where the probe began if that
+        // lies inside it, whether it runs compiled or not)
+        let chunk = if probing > 0 { c1.block_len_to(&mut bus, probe.0).max(1) as u64 } else { busy };
         let k = match c1.run_fast(&mut bus, chunk as u32) {
             Ok((0, _)) => {
                 if let Err(e) = c1.step(&mut bus) {

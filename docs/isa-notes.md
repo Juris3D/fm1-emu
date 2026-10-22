@@ -455,6 +455,35 @@ the `composed_imm` 12-bit form (bits 16..27; the assembler calls it `timm12` and
 -2). Checked against the assembler for 22 encodings, and in ADD-1's own build with the pair
 restored.
 
+### M-VAVE's FM1 Open and the compiler's builtins (2026-10-19)
+
+M-VAVE's open SDK (open.m-vave.com) links its app against `libfm1_engine.a`, whose mixers and
+envelopes are hand-written DSP assembly, and the vendor clang has ~40 `__builtin_pi32v2_*`
+functions any firmware can call. Encodings from the vendor assembler and compiler
+(`work/probe/dsp.S`, `fam.S`, `mm.S`, `bi/*.c`); meanings from the compiler's own choices where it
+makes one (`work/probe/sem.c`). `tools/sem_check.py` runs every register instruction of a listing
+against objdump's text from random registers (`fm1-emu --sem-run`): the corpora, the engine and
+the probes, ~175000 distinct instructions, agree except four shapes only data decodes to.
+
+- **Pair extract** `de e1`: rD = rQ >> n (s|u); d = bits(28,31), q = bits(21,23), n = bits(16,19) |
+  bits(24,25) << 4, signed = bit27. `df e1` by a register (bits 24-27; signed = bit16). Saturated
+  into 32 bits (assumed: clang uses it only for `__builtin_pi32v2_shfms64` / `shfmu64`, never for
+  a plain `(int)(x >> n)`, which it does with a pair shift).
+- **`<<<` saturates** (`qasl`): the 2-byte `xx a0` / `SD 1a` with bit 3, `c0 e1` op 2 (bits 25-27),
+  `c8 e1` sub-op 1. Plain C shifts compile to `<<`; it used to run as one.
+- **Shift counts are 1..32**: 32 encoded as 0 in the 4-byte `c0 e1` forms too (the assembler's
+  range), as in the 2-byte ones.
+- `39 e4` rD = rA +|- rB (ssat), subtract = bit19; `34`/`35 e4` max / min, bit16 signed; `20 e0`
+  rD.bN = #i (N = bits 26,27); `70 e0 80` revs(rS.l) = `(short)bswap16`; `d4 e1` / `dc e1` the
+  64-bit rotate right (compiler's `(x >> n) | (x << (64 - n))`); `78 e0` sat16 and `94 e1`
+  rD = rA & ~(1 << rB) on all registers.
+- Assumed, no C equivalent: `80 e1 01` cls = leading bits equal to the sign, sign not counted;
+  `b0 e0` rD += rS (brev), a bit-reversed add. `80 e1 02` zcmp is left undecoded (unknown).
+  The six 64-bit multiply builtins do not compile (the backend cannot select them).
+- These decode before the table: its classes fit only corpus registers or had no semantics
+  (`r_add_r_brev`, `r_b2_mov_i`), and they caught the dual-issue `f0` / `f1` heads.
+- The ALNK0 receive channel pends too (bit 4 for channel 0): FM1 Open renders a block only then.
+
 ### Remaining exec gaps (known, traced)
 
 - goto/if branch-offset fields: printed = word offset (delta = 2*printed)

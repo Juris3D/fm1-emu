@@ -438,6 +438,14 @@ impl Periph {
             let words = self.alnk_len.max(2);
             due.audio_half = Some((self.alnk_adr.wrapping_add(self.alnk_half * words * 4), words));
             self.alnk_half ^= 1;
+            // every channel CON1 sets up pends with the block: FM1 Open's driver takes its
+            // interrupt from the receive channel 0 (pending bit 4), the stock one from transmit
+            // channel 3 (bit 7)
+            for ch in 0..4 {
+                if (self.alnk_con1 >> (4 * ch)) & 0xf != 0 {
+                    self.alnk_pend |= 0x10 << ch;
+                }
+            }
             self.alnk_pend |= 0x80;
             self.alnk_next += self.half_period();
             self.audio_halves += 1;

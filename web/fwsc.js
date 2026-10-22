@@ -114,12 +114,37 @@ export function appFromPackage(file) {
   throw new Error("no app.bin in the app area");
 }
 
+// The package the FM-1 Firmware Hub lists now for its firmware `id`, and its version (the Hub's
+// catalog.json, read once; asked again after a failure): the Hub removes a firmware's old package
+// when a new version comes, so web/firmwares.json's goes stale between runs of
+// tools/hub_catalog.mjs. { url, version } or null. (One catalog per fetch function: the page's is
+// fetch; a test's its own.)
+const HUB = "https://thefirmwarehub.com/";
+const hubCatalogs = new WeakMap();
+async function hubPackage(id, fetchFn) {
+  try {
+    if (!hubCatalogs.has(fetchFn)) {
+      hubCatalogs.set(fetchFn, fetchFn(HUB + "catalog.json").then((r) => {
+        if (!r.ok) throw new Error(`catalog.json: ${r.status}`);
+        return r.json();
+      }));
+    }
+    const h = (await hubCatalogs.get(fetchFn))?.firmwares?.find((h) => h.id === id);
+    return h?.pkg ? { url: new URL(h.pkg, HUB).href, version: h.version == null ? null : String(h.version) } : null;
+  } catch {
+    hubCatalogs.delete(fetchFn);
+    return null;
+  }
+}
+
 // Fetch a catalog entry's package (web/firmwares.json): its `package` URL, or when that has
-// gone (a newer version replaced it) the .fwsc its `installer` page links now, found in the
+// gone (a newer version replaced it) the package the Hub lists now (an entry with `hub`), or
+// the .fwsc its `installer` page links now, found in the
 // page or the scripts it loads, or named by its `manifest` (a JSON file whose `package` or
 // `file` is relative to it: ORBIT's manifest.json, FiMba-1's latest.json). An entry with
 // `embedded` names the variable its installer page keeps the package in, base64 (April OS's
-// `DEFAULT_FIRMWARE`). Returns { bytes, url }.
+// `DEFAULT_FIRMWARE`). Returns { bytes, url }, and `version` when the package is the Hub's newer one
+// (the entry's own version is then not what runs).
 // `fetchFn` is fetch (browser, Node 18+).
 export async function fetchPackage(entry, fetchFn = fetch) {
   if (entry.embedded) {
@@ -134,6 +159,13 @@ export async function fetchPackage(entry, fetchFn = fetch) {
   }
   let r = await fetchFn(entry.package);
   if (r.ok) return { bytes: new Uint8Array(await r.arrayBuffer()), url: entry.package };
+  if (entry.hub) {
+    const now = await hubPackage(entry.hub, fetchFn);
+    if (now && now.url !== entry.package) {
+      const h = await fetchFn(now.url);
+      if (h.ok) return { bytes: new Uint8Array(await h.arrayBuffer()), url: now.url, ...(now.version && { version: now.version }) };
+    }
+  }
   if (entry.manifest) {
     const m = await (await fetchFn(entry.manifest)).json();
     const url = new URL(m.package || m.file, entry.manifest).href;

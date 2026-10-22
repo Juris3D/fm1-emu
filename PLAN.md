@@ -736,6 +736,94 @@ audit_decode.py now compares the pre- / post-increment accesses too (`describe`'
 same `decode_inc_mem` routes 18 / 19 run): +7610 compared in the stock app's listing, all agree;
 with route 19's old sext10 put back it reports 135 disagreements in the fuzz listing.
 
+## 5.23 The Hub's old packages go away (2026-10-20)
+
+A user reported firmwares failing with 404: the Hub removes a firmware's old package when a
+new version comes, so 18 of web/firmwares.json's 47 Hub packages (written 2026-10-16) were gone.
+`fetchPackage` (web/fwsc.js) now asks the Hub's catalog.json (once) for an entry with `hub`
+whose package has gone, and fetches the one listed now. The list is rebuilt from the Hub: 73
+entries, 71 community, 24 new. Each was booted 8 s in fm1-live (a note on the panel and over
+MIDI, then PLAY): all but five play or draw their screen. Left out (SKIP in hub_catalog.mjs):
+Melodee 1.4.5 (black screen, interrupts off; 1.3.6 ran), OberVave 1.5.3, 386DX, MC-1 and Shine
+On (each halts on a decode not known yet: `64 e8 5f bc`, `64 f0 00 ae`, `64 f0 00 0e`,
+`64 e8 5f b9` ...).
+
+## 5.24 The JIT on x86-64 Linux (2026-10-21)
+
+`jit/x64.rs` compiles the same block prefixes as the AArch64 compiler, op for op, sharing
+everything else in jit.rs (code cache, chaining, the helpers that keep timing exact, the RAM
+guards); `jit_x64.rs` is its encoder (86 encodings checked against LLVM's assembler). System V:
+rbx / rbp / r12..r15 hold Cpu, Ctx, RAM, XIP, the count and the code flags; the limit and the two
+values kept across a helper call live in the frame. Floats in SSE (what Rust's f32 gives on the
+host); conversions to integers saturate as Rust's `as` (cvttss2si alone does not); fmin / fmax
+through the interpreter. One cfg, `native_jit` (fm1-core's build.rs), says where a JIT is built.
+A new test compiles every inline micro-op alone and runs it from random registers (NaN, both
+zeros, infinities, out-of-range floats) against the interpreter: both backends agree. (It found
+two places where the AArch64 code differs from the interpreter, neither decodable: a float
+condition on `BrI`, FPU op 4.)
+Measured on an x86-64 Linux box (Core Ultra 7 155H, Docker capped at 1.5 CPUs): all 49
+firmwares and the stock firmware's audio the same with the JIT and interpreted, and the same as
+on Apple silicon; 2.41x the interpreter (geomean), every firmware faster than real time
+(slowest Doom 1.19x, zp12 1.26x). CI runs the Linux arm64 job's checks on an x86-64 runner too.
+
+## 5.25 The catalog a day later: 83 firmwares (2026-10-21)
+
+A day after 5.23 the Hub had five new firmwares (Bytemania, Chipbox, Flyfish, Kawa, Mutable) and
+19 new versions (SLOOP 2.8, FMini 1.8.0, Beetle 1.3.8, CTL 1.0, ...). With #33 / #34 merged,
+Melodee 1.4.5, OberVave 1.5.3 and Shine On come off the skip list. Two decodes the vendor objdump
+names: `64 f0 00|80 XY`, the special-register moves as a dual-issue head (`r2 = rets  #`: CTL 1.0,
+386DX and MC-1 halted on it; `sreg_move_raw` took `64 e0` only), and `60 ff` bit-test branches
+(`if ((r0 & 0x1) == 0) goto`: Kawa; the table's class had `61 ff` with a forward offset only;
+`decode_bittest` already knew both). Of 131584 words of the two families, the only ones whose
+decode changes either halted before or (two) run the same. Booted 8 s each (a note, then PLAY): all
+82 packages run, no halts; the 78 that ran before give the same audio. Kawa, a tracker, is silent
+under the script but draws its screen and plays. Only Bubba stays out (black screen).
+The page now shows the version that runs when a package has gone and the Hub's newer one came
+instead (fetchPackage returns its `version`); a failed Hub catalog is asked again rather than
+turning the fallback off.
+
+## 5.26 The JIT on Windows (2026-10-21)
+
+The x86-64 JIT (5.24) on Windows too, with its code unchanged: the generated code's entry and
+the helpers it calls are `extern "sysv64"` on x86-64 (`code_abi!`, `CodeFn` in jit.rs), so it
+keeps the System V register plan on Windows as well, and Rust saves around the call what Win64
+wants kept (rdi, rsi, xmm6..15). The code cache comes from VirtualAlloc (read-write-execute, as
+the Linux mapping; after luginf's fork, issue #3, whose JIT took the Win64 convention into its
+code generator instead). CI runs the core tests (the random-state test of every compiled op
+included) and SID with the JIT against the interpreter on a Windows runner. (Issue #21 is the
+browser page on Windows, not fm1-live: this gives such users a fast native player, it does not
+change the page.)
+
+## 5.27 The peripheral window by table (2026-10-22)
+
+A profile review (four reviewers, one per area: interpreter, native JIT, SoC, browser) found
+`Soc::region` the top function of FM1-DOOM and ZP-12 (about a quarter of their time): a chain of
+some 30 compares, with P33 (0x13e08) near its end, which their SDK's main loop touches every
+round (a watchdog kick). Now 0x10000..0x14000 is a table of 8-byte cells, the rest below
+0x0100_0000 a short match (no memory region lies there), the memory regions as before; a test
+compares it with the old chain for every address below 0x60000 on both boards. All 82 catalog
+firmwares, the stock one and FM1 Open, JIT and interpreted: the same audio, byte for byte. JIT
+geomean +6% (FM1-DOOM 1.55x -> 2.23x, Etch +37%, ZP-12 +26%, Beetle +23%, OberVave +16%),
+interpreted +2.4%; in the browser +3-5% on those (its bigger costs are elsewhere).
+
+## 5.28 Run budgets to the instruction: the JIT gives the interpreter's output (2026-10-22)
+
+`run_fast` checked its budget per block, so a call ran up to a block past it, and the JITs were
+handed `max(budget left, block length)`: where a call stopped depended on where blocks began, and
+compiled code (which leaves at the end of its prefix, before a careful op) stopped elsewhere than
+the interpreter. Cores interleave and interrupts are taken where calls stop, so on master 10 of 84
+firmwares (Felucca, FMel, Frodhes, Ketch, Melodee, OPN1, X0X, X0XRMX, the stock firmware, FM1 Open)
+played differently with the JIT than interpreted. Now the budget holds to the instruction (checked
+per op; the JITs get exactly what is left, and compiled code runs a block only while it fits), so
+both stop at the same one: all 84 the same, JIT and interpreted. cpu1's idle probe, which ran a
+block per call (budget 1), now runs the block at pc up to where the probe began if that lies inside
+it (`Cpu::block_len_to`): with calls ending mid-block, the place to come back to need not start a
+block, and the probe missed it (NMSFM's core 1 ran 100 M instructions a second instead of 2.4 M).
+Against master: 20 firmwares play with interrupts a few instructions earlier or later (where a
+budget now ends), the same levels (peaks within 2 counts); speed geomean -1.3% JIT, -0.8%
+interpreted (noise). This also unblocks changes that move block boundaries (5.27's review: the
+polling-loop skip without its 4096 cap, untimed peripheral writes).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

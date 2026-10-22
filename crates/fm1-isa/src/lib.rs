@@ -195,10 +195,21 @@ impl Instruction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DecodeError {
     /// No table entry matched the window.
     UnknownInstruction { raw: u64, addr: u32 },
+}
+
+// (in hex: the derived form printed the address in decimal, 33568008 for 0x02003508)
+impl std::fmt::Debug for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::UnknownInstruction { raw, addr } => {
+                write!(f, "UnknownInstruction {{ raw: {raw:#014x}, addr: {addr:#010x} }}")
+            }
+        }
+    }
 }
 
 /// Decode from a zero-extended little-endian window of up to 6 bytes.
@@ -313,6 +324,16 @@ mod tests {
         // `74 04` = {rets, r4}; `75 04` = {rets, r5, r4} — sibling masks.
         assert_eq!(le("7404").unwrap().syntax(), "[--sp] = {rets, R*1}");
         assert_eq!(le("7504").unwrap().syntax(), "[--sp] = {rets, R*2}");
+    }
+
+    #[test]
+    fn sp_from_any_register() {
+        // `64 e0 80 Ne`: sp = rN, the register in bits 28-31 (FM1 Open's `sp = r5` is `5e`)
+        for n in 0..16u64 {
+            let i = decode_win(0x0e80_e064 | n << 28, 0).unwrap();
+            assert_eq!(i.syntax(), "sp = R");
+            assert_eq!(i.entry.slots[0].value(i.raw), n as i64);
+        }
     }
 
     #[test]

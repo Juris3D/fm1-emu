@@ -13,6 +13,10 @@
 //! 1/2), 06/04 (WREN/WRDI), 03/0B (read / fast read), 20 (4 KiB erase),
 //! D8 (64 KiB erase), 02 (page program). Erase/program are instantaneous;
 //! status never reports busy.
+//!
+//! Power cuts (FM1_FLASH_CUT=N): the Nth erase or page program is cut half way (the first
+//! half of its bytes changed, the rest as before), and nothing after it reaches the chip, as if
+//! the power went there. With fm1-live's `--flash FILE` the next run boots from what was left.
 
 pub const SPI0_BASE: u32 = 0x11c00;
 pub const FLASH_SIZE: usize = 1 << 20;
@@ -37,6 +41,10 @@ pub struct SpiFlash {
     pub changed: Option<(usize, usize)>,
     /// Persistence generation, independent of the range consumed by XIP synchronization.
     pub revision: u32,
+    /// Erases and page programs so far (the power-cut points)
+    pub ops: u32,
+    /// FM1_FLASH_CUT: the op that is cut half way; none reach the chip after it
+    pub cut_at: Option<u32>,
 }
 
 impl SpiFlash {
@@ -55,6 +63,8 @@ impl SpiFlash {
             trace: std::env::var_os("FM1_FLASH_TRACE").is_some(),
             changed: None,
             revision: 0,
+            ops: 0,
+            cut_at: std::env::var("FM1_FLASH_CUT").ok().and_then(|v| v.parse().ok()),
         }
     }
 
@@ -77,13 +87,16 @@ impl SpiFlash {
         }
         if !low && self.cs_low && self.cmd == 0x02 {
             // page program commits on CS release
-            for (i, b) in self.pending_prog.iter().enumerate() {
+            let n = match self.op() { Some(true) => self.pending_prog.len(), Some(false) => self.pending_prog.len() / 2, None => 0 };
+            for (i, b) in self.pending_prog.iter().take(n).enumerate() {
                 let a = (self.addr as usize + i) & (FLASH_SIZE - 1);
                 self.mem[a] &= *b;
             }
             let a = self.addr as usize & (FLASH_SIZE - 1);
-            self.changed = Some((a, (a + self.pending_prog.len()).min(FLASH_SIZE)));
-            self.revision = self.revision.wrapping_add(1);
+            if n > 0 {
+                self.changed = Some((a, (a + n).min(FLASH_SIZE)));
+                self.revision = self.revision.wrapping_add(1);
+            }
             self.pending_prog.clear();
             self.wel = false;
         }
@@ -143,17 +156,34 @@ impl SpiFlash {
         }
     }
 
+    /// One more erase / program: Some(true) done whole, Some(false) cut half way, None after the cut.
+    fn op(&mut self) -> Option<bool> {
+        self.ops += 1;
+        match self.cut_at {
+            Some(c) if self.ops > c => None,
+            Some(c) if self.ops == c => Some(false),
+            _ => Some(true),
+        }
+    }
+
+    /// Has the power been cut (FM1_FLASH_CUT reached)?
+    pub fn cut(&self) -> bool { self.cut_at.is_some_and(|c| self.ops >= c) }
+
     fn erase(&mut self, size: usize) {
         if !self.wel {
             return;
         }
+        let n = match self.op() { Some(true) => size, Some(false) => size / 2, None => 0 };
         let base = (self.addr as usize) & !(size - 1) & (FLASH_SIZE - 1);
-        for b in &mut self.mem[base..(base + size).min(FLASH_SIZE)] {
+        self.wel = false;
+        if n == 0 {
+            return;
+        }
+        for b in &mut self.mem[base..(base + n).min(FLASH_SIZE)] {
             *b = 0xff;
         }
-        self.changed = Some((base, (base + size).min(FLASH_SIZE)));
+        self.changed = Some((base, (base + n).min(FLASH_SIZE)));
         self.revision = self.revision.wrapping_add(1);
-        self.wel = false;
     }
 
     pub fn read(&mut self, addr: u32) -> u32 {

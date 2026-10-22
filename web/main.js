@@ -186,7 +186,17 @@ async function packageOf(f) {
   }
   const got = await fetchPackage(f);
   packages.set(f.id, got);
+  noteVersion(f, got.version);
   return got;
+}
+// A package that had gone came as the one the Hub lists now: show the version that runs.
+function noteVersion(f, version) {
+  if (!version || version === f.version) return;
+  f.version = version;
+  const opt = [...fwSel.options].find((o) => o.value === f.id);
+  if (opt) opt.text = `${f.name} ${f.version}`;
+  cards.get(f.id)?.querySelector(".head .dim")?.replaceChildren(f.version);
+  if (f === fw) showFirmware();
 }
 const keptLocal = await keptEntry("local");
 if (keptLocal) {
@@ -991,6 +1001,7 @@ document.getElementById("update-firmware").addEventListener("click", action(asyn
   const got = await fetchPackage(selected);
   const hash = await packageHash(got.bytes);
   packages.set(selected.id, got);
+  noteVersion(selected, got.version);
   if (fw !== selected) return;
   if (running?.record.hash === hash) { saveMessage("Firmware is up to date"); return; }
   if (node) await boot();
