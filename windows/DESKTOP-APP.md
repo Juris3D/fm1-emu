@@ -30,7 +30,8 @@ program for both: a package says which board it runs on, and the panel follows i
 - The synth's controls (knobs, buttons, pads, faders, wheels) are reorganized onto the sides of the
   big screen instead of their real-panel positions. Both boards get their own side layout; the
   keybed stays along the bottom.
-- The real-panel layout remains available: the user switches between "real" and "big screen".
+- The real-panel ("legacy") layout stays, more or less as it is, and is the default at first; "big
+  screen" is the option to switch to.
 
 ## Rules
 
