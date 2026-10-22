@@ -14,8 +14,8 @@
 //! host (the interpreter); conversions to integers saturate as Rust's `as` does (cvttss2si alone
 //! gives 0x8000_0000 for NaN and out of range); min / max through the interpreter's executor.
 
-use super::{h_op, h_ram_ok, h_read, h_write, off_hold, off_pc, off_reg, off_rets, off_sp, JitMem, RamGuard, OFF_BRK, OFF_SLOT};
-use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
+use super::{h_icfg, h_irq_window, h_op, h_ram_ok, h_read, h_write, off_hold, off_icfg_store, off_ie, off_pc, off_reg, off_rets, off_sp, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_PRED, OFF_SLOT};
+use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Mem, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
 use crate::{Base, Bus, Cond, Fast, Op, RmwOp};
 
 const CPU: Reg = RBX;
@@ -37,6 +37,10 @@ struct Gen<'a> {
     h_read: u64,
     h_write: u64,
     h_op: u64,
+    /// the indirect-jump cache (`jit::ITab`)
+    itab: u64,
+    /// inside an if-else block's then-part: (then end, else end), the skip taken at its end
+    pred: Option<(u32, u32)>,
 }
 
 fn icond(c: Cond) -> Cc {
@@ -125,10 +129,26 @@ impl Gen<'_> {
         self.a.st_imm(m(CPU, off_pc() as i32), pc);
         self.leave(count);
     }
-    /// Leave with pc = reg.
+    /// Continue at pc = eax, known only now (a return, a table branch): straight into its
+    /// compiled body when the indirect-jump cache has it (the body checks the limit itself, as a
+    /// chained one does), else back to Rust, which puts it there once it is compiled.
     fn exit_reg(&mut self, reg: Reg, count: u32) {
-        self.a.st(m(CPU, off_pc() as i32), reg);
-        self.leave(count);
+        debug_assert!(reg == RAX);
+        let miss = self.a.label();
+        self.a.st(m(CPU, off_pc() as i32), RAX);
+        self.add_imm(DONE, count);
+        // ecx = the entry's offset: ((pc >> 1) & mask) * 16
+        self.a.mov_rr(RCX, RAX);
+        self.a.alu_ri(Alu::And, RCX, ((1u32 << ITAB_BITS) - 1) << 1);
+        self.a.sh_i(Sh::Shl, RCX, 3);
+        self.a.mov_ri64(R10, self.itab);
+        self.a.cmp_rm(RAX, mx(R10, RCX));
+        self.a.jcc(Cc::Ne, miss);
+        self.a.ld64(R11, Mem { base: R10, index: Some((RCX, 1)), disp: 8 });
+        self.a.jmp_r(R11);
+        self.a.bind(miss);
+        self.a.mov_rr(RAX, DONE);
+        self.a.jmp(self.exit);
     }
     /// Continue at a fixed pc: straight into its compiled body when the slot holds one,
     /// else back to Rust, which fills the slot once that block is compiled.
@@ -312,13 +332,23 @@ impl Gen<'_> {
         if hold {
             self.a.st_imm(m(CPU, off_hold() as i32), 1);
         }
-        self.exit_imm(next_pc, count);
+        match self.pred {
+            // inside an if-else block's then-part: at its end the skip is taken (as `finish`),
+            // before it the skip goes with the exit (`run` puts it in pred_skips)
+            Some((te, ee)) if next_pc == te => self.exit_imm(ee, count),
+            Some((te, ee)) => {
+                self.a.st_imm(m(CTX, OFF_PRED as i32), te);
+                self.a.st_imm(m(CTX, OFF_PRED as i32 + 4), ee);
+                self.exit_imm(next_pc, count);
+            }
+            None => self.exit_imm(next_pc, count),
+        }
         self.a.bind(go);
     }
 }
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
-pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool) -> Option<(Vec<u8>, usize)> {
+pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     let mut a = Asm::new();
     let exit = a.label();
     let mut g = Gen {
@@ -328,6 +358,8 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
         h_op: if profile { h_op::<B, true> as *const () as u64 } else { h_op::<B, false> as *const () as u64 },
+        itab,
+        pred: None,
     };
     // prologue (entry from Rust: rdi cpu, rsi ctx, rdx ram, rcx xip, r8d limit, r9 code flags);
     // chained blocks enter at the body. Six pushes and the frame keep rsp 16-byte aligned for
@@ -372,12 +404,34 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         g.a.bind(valid);
     }
 
+    // the order the ops run in: a swapped pair's second before its head (`super::swapped_pair`)
+    let mut pcs = Vec::with_capacity(ops.len());
+    let mut q = pc0;
+    for o in ops {
+        pcs.push(q);
+        q += o.len as u32;
+    }
+    let mut order: Vec<usize> = (0..ops.len()).collect();
+    let mut k = 0;
+    while k < ops.len() {
+        if ops[k].careful && super::swapped_pair(&ops[k], ops.get(k + 1)) {
+            order.swap(k, k + 1);
+            k += 2;
+        } else {
+            k += 1;
+        }
+    }
+    // (a swapped pair's second ran: its exit check, once the head has run too)
+    let mut second_used: Option<bool> = None;
     let mut pc = pc0;
-    for (i, op) in ops.iter().enumerate() {
+    for (pos, &i) in order.iter().enumerate() {
+        let op = &ops[i];
         let idx = i as u32;
-        let next_pc = pc + op.len as u32;
+        let next_pc = pcs[i] + op.len as u32;
         let count = idx + 1;
         let mut bus_used = false;
+        let swapped_second = pos + 1 < order.len() && order[pos + 1] + 1 == i;
+        let swapped_head = second_used.is_some();
         match op.fast {
             Fast::Nop => {}
             Fast::MovI { d, v } => {
@@ -510,6 +564,42 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
             Fast::Call { target } => {
                 g.a.st_imm(m(CPU, off_rets() as i32), next_pc);
                 g.chain(target, count);
+            }
+            Fast::IfBlk { a, rk, fam, alt, has_else: true, rv, then_d, else_d } => {
+                // an if-else block (jit_wasm's plan): not taken, on at the else part; taken, the
+                // then-part the caller brought along (`Cpu::native_if_else`), then past the else
+                // part. Without it, a taken one leaves with the skip for the interpreter.
+                if g.pred.is_some() {
+                    return None; // (never: a then-part holds no careful op)
+                }
+                let then_end = next_pc.wrapping_add(then_d as u32);
+                let else_end = then_end.wrapping_add(else_d as u32);
+                let taken = g.a.label();
+                g.rhs(rk, rv);
+                g.ld_reg(RAX, a);
+                if fam == 2 {
+                    g.a.test_rr(RAX, RCX);
+                    g.a.jcc(if alt { Cc::Ne } else { Cc::E }, taken);
+                } else {
+                    g.branch(crate::cond_of_fam(fam as u64, alt), taken);
+                }
+                g.chain(then_end, count);
+                g.a.bind(taken);
+                if i + 1 == ops.len() {
+                    if then_d == 0 {
+                        // an empty then-part: its skip is taken at once
+                        g.chain(else_end, count);
+                    } else {
+                        g.a.st_imm(m(CTX, OFF_PRED as i32), then_end);
+                        g.a.st_imm(m(CTX, OFF_PRED as i32 + 4), else_end);
+                        g.exit_imm(next_pc, count);
+                    }
+                    pc = next_pc;
+                    break;
+                }
+                g.pred = Some((then_end, else_end));
+                pc = next_pc;
+                continue;
             }
             Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
                 // without an else part a predicated block is a conditional jump over its then part
@@ -804,6 +894,28 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 g.st_sp(RDX);
                 g.exit_reg(RAX, count);
             }
+            // ---- interrupt enables (critical sections: GHOULBOX runs ~10 M of each per second)
+            Fast::SetIe { on } => {
+                g.a.mov_ri(RAX, on as u32);
+                g.a.st8(m(CPU, off_ie() as i32), RAX);
+                if on {
+                    g.a.mov_rr64(RDI, CTX);
+                    g.call(h_irq_window::<B> as *const () as u64);
+                    bus_used = true;
+                }
+            }
+            Fast::IcfgRd { d } => {
+                g.a.mov_rr64(RDI, CPU);
+                g.call(h_icfg as *const () as u64);
+                g.st_reg(RAX, d);
+            }
+            Fast::IcfgWr { s } => {
+                g.ld_reg(RAX, s);
+                g.a.st(m(CPU, off_icfg_store() as i32), RAX);
+                g.a.mov_rr64(RDI, CTX);
+                g.call(h_irq_window::<B> as *const () as u64);
+                bus_used = true;
+            }
             // ---- everything else: the interpreter's executor for this one op
             other => {
                 let p: &'static Fast = Box::leak(Box::new(other));
@@ -824,6 +936,20 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 }
             }
         }
+        if swapped_second {
+            second_used = Some(bus_used);
+            continue;
+        }
+        if swapped_head {
+            // the pair done: leave (if the bus asked to) after its second instruction
+            let used = second_used.take() == Some(true);
+            let (snext, scount) = (pcs[i + 1] + ops[i + 1].len as u32, count + 1);
+            if used || bus_used {
+                g.check_brk(snext, scount, false);
+            }
+            pc = snext;
+            continue;
+        }
         if bus_used && !op.fast.may_jump() {
             // leaving between a glued pair's two instructions: interrupts wait for the second
             g.check_brk(next_pc, count, op.glue);
@@ -833,10 +959,19 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
             break; // (the block's last op)
         }
     }
-    // fell off the end of the prefix
+    // fell off the end of the prefix (an if-else block's then-part's end: past its else part)
     let n = ops.len() as u32;
     if !ops.last().map_or(false, |o| o.fast.may_jump()) {
-        g.chain(pc, n);
+        match g.pred {
+            Some((te, ee)) if pc == te => g.chain(ee, n),
+            Some((te, ee)) => {
+                // (a then-part cut short: the skip goes with the exit)
+                g.a.st_imm(m(CTX, OFF_PRED as i32), te);
+                g.a.st_imm(m(CTX, OFF_PRED as i32 + 4), ee);
+                g.exit_imm(pc, n);
+            }
+            None => g.chain(pc, n),
+        }
     }
     g.a.bind(exit);
     g.a.alu_ri64(Alu::Add, RSP, FRAME as i8);

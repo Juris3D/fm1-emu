@@ -63,12 +63,34 @@ pub struct Ctx {
     _pad: u32,
     /// the chain slot of the exit taken back to Rust (null: not a chainable exit)
     slot: *mut u64,
+    /// left inside an if-else block's then-part: its skip (then end, else end), for `run` to put
+    /// in `Cpu::pred_skips` as the interpreter has it there (0: none). As jit_wasm's.
+    pred: [u32; 2],
     code_version: Option<u64>,
 }
 const OFF_BRK: u32 = 24;
 const OFF_SLOT: u32 = 32;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const OFF_PRED: u32 = 40;
 const _: () = assert!(std::mem::offset_of!(Ctx, brk) == OFF_BRK as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
+const _: () = assert!(std::mem::offset_of!(Ctx, pred) == OFF_PRED as usize);
+
+/// The indirect-jump cache: compiled code that jumps to a pc it only knows at run time (a return,
+/// a table branch) looks the pc up here and goes straight into that block's body on a hit, as a
+/// chained exit does; a miss leaves for Rust, which puts the target in once it is compiled.
+/// Direct-mapped by pc, one entry per slot; `tag` is the block's pc (1, an odd pc, when empty).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ITab {
+    tag: u32,
+    _pad: u32,
+    body: u64,
+}
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) const ITAB_BITS: u32 = 12;
+const ITAB_EMPTY: ITab = ITab { tag: 1, _pad: 0, body: 0 };
+const _: () = assert!(std::mem::size_of::<ITab>() == 16);
 
 // ------------------------------------------------------------------ executable memory
 // macOS (Apple silicon): a MAP_JIT mapping, writable or executable per thread, toggled around a
@@ -188,14 +210,25 @@ pub struct Jit {
     guards: Vec<Box<RamGuard>>,
     /// compile helper calls that count themselves (`Cpu::profile` when the JIT was made)
     profile: bool,
+    /// the indirect-jump cache (its address is in the generated code: never reallocated)
+    itab: Box<[ITab]>,
 }
 
 #[derive(Clone, Copy)]
 enum Entry {
     Cold(u32),
-    /// function start, body (chain target), prefix length
-    Code(*const u8, *const u8, u32),
+    /// function start, body (chain target), what it covers
+    Code(*const u8, *const u8, Covers),
     No,
+}
+
+/// What a compiled block covers: its instructions, their bytes from its pc, and whether an
+/// if-else block is among them (its skip handled in the code).
+#[derive(Clone, Copy)]
+pub(crate) struct Covers {
+    pub n: u32,
+    pub bytes: u32,
+    pub if_else: bool,
 }
 
 // SAFETY: the code cache and the compiled entries are owned by one Cpu and only used by the
@@ -211,32 +244,89 @@ impl std::fmt::Debug for Jit {
 /// Runs of a block before it is compiled.
 const HOT: u32 = 32;
 
+/// A careful op the native compiler still takes: on x86-64, an if-else block (its then-part runs
+/// inline, then past the else part; a skip still pending at an exit goes to `Cpu::pred_skips`).
+#[inline]
+fn compiles_careful(o: &crate::BOp) -> bool {
+    cfg!(target_arch = "x86_64") && matches!(o.fast, Fast::IfBlk { has_else: true, .. }) && !o.pair_head && !o.glue
+}
+
+/// A dual-issue pair the native compiler takes (x86-64), second instruction first. The pair's rule
+/// (`Cpu::exec_fast_paired`): the head's register results are held back until the second has run,
+/// so the second reads the old values; where both wrote a register, the second's stands. With a
+/// head that only computes registers from registers (no memory, sp, rets or flags) and a second
+/// that writes none of the registers the head reads or writes, running the second and then the
+/// head gives exactly that, memory effects in the same order (the head has none). The block's
+/// exit check for the second waits until the head has run too.
+pub(crate) fn swapped_pair(a: &crate::BOp, b: Option<&crate::BOp>) -> bool {
+    if !cfg!(target_arch = "x86_64") || !a.pair_head || a.glue || a.flags_live {
+        return false;
+    }
+    let Some(b) = b else { return false };
+    if b.careful || b.pair_head || b.glue || b.fast.may_jump() {
+        return false;
+    }
+    if !matches!(a.fast, Fast::MovI { .. } | Fast::Mov { .. } | Fast::AddRI { .. } | Fast::ShlI { .. } | Fast::SarI { .. }
+        | Fast::Alu3 { .. } | Fast::Alu3I { .. } | Fast::Alu2 { .. } | Fast::Alu2I { .. } | Fast::A4 { .. }
+        | Fast::Ext { .. } | Fast::MinMax { .. })
+    {
+        return false;
+    }
+    let (Some((ar, aw)), Some((_, bw))) = (a.fast.regs_rw(), b.fast.regs_rw()) else { return false };
+    bw & (ar | aw) == 0
+}
+
+/// How many of a block's ops the native compiler takes: up to the first careful op it cannot.
+pub(crate) fn compilable_prefix(ops: &[crate::BOp]) -> usize {
+    let mut n = 0;
+    while n < ops.len() {
+        let o = &ops[n];
+        if !o.careful || compiles_careful(o) {
+            n += 1;
+        } else if swapped_pair(o, ops.get(n + 1)) {
+            n += 2;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
 impl Jit {
     pub fn new(profile: bool) -> Option<Jit> {
-        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile })
+        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile,
+                   itab: vec![ITAB_EMPTY; 1 << ITAB_BITS].into_boxed_slice() })
     }
 
     /// The compiled code of block `id` (prefix length), compiling it once it is hot.
-    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(*const u8, u32)> {
+    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(*const u8, Covers)> {
         if self.state.len() <= id {
             self.state.resize(id + 1, Entry::Cold(0));
         }
         match self.state[id] {
-            Entry::Code(p, _, n) => Some((p, n)),
+            Entry::Code(p, _, c) => Some((p, c)),
             Entry::No => None,
             Entry::Cold(c) if c + 1 < HOT => {
                 self.state[id] = Entry::Cold(c + 1);
                 None
             }
             Entry::Cold(_) => {
-                let plen = ops.iter().take_while(|o| !o.careful).count();
+                let plen = compilable_prefix(ops);
                 let e = if plen == 0 {
                     Entry::No
                 } else {
-                    match compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile) {
+                    #[cfg(target_arch = "x86_64")]
+                    let code = compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile, self.itab.as_ptr() as u64);
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let code = compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile);
+                    match code {
                         Some((code, body)) => match self.cache.write(&code) {
                             // SAFETY: body is a byte offset inside the code just written
-                            Some(p) => Entry::Code(p, unsafe { p.add(body) }, plen as u32),
+                            Some(p) => Entry::Code(p, unsafe { p.add(body) }, Covers {
+                                n: plen as u32,
+                                bytes: ops[..plen].iter().map(|o| o.len as u32).sum(),
+                                if_else: ops[..plen].iter().any(|o| matches!(o.fast, Fast::IfBlk { has_else: true, .. })),
+                            }),
                             None => Entry::No,
                         },
                         None => Entry::No,
@@ -244,7 +334,7 @@ impl Jit {
                 };
                 self.state[id] = e;
                 match e {
-                    Entry::Code(p, _, n) => Some((p, n)),
+                    Entry::Code(p, _, c) => Some((p, c)),
                     _ => None,
                 }
             }
@@ -259,8 +349,27 @@ impl Jit {
         }
     }
 
+    /// Will the next `entry` of block `id` compile it (if it can)? The caller then brings an
+    /// if-else block's then-part along.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn compiles_next(&self, id: usize) -> bool {
+        match self.state.get(id) {
+            Some(Entry::Cold(c)) => c + 1 >= HOT,
+            None => HOT <= 1,
+            _ => false,
+        }
+    }
+
+    /// Put pc's compiled body in the indirect-jump cache.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn itab_put(&mut self, pc: u32, body: *const u8) {
+        let i = (pc >> 1) as usize & ((1 << ITAB_BITS) - 1);
+        self.itab[i] = ITab { tag: pc, _pad: 0, body: body as u64 };
+    }
+
     /// Forget every compiled block (the block table was rebuilt).
     pub fn reset(&mut self) {
+        self.itab.iter_mut().for_each(|e| *e = ITAB_EMPTY);
         self.state.clear();
         self.cache.used = 0;
         self.guards.clear();
@@ -274,9 +383,14 @@ impl Jit {
 pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, cap: u32) -> (u32, *mut u64) {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut(), code_version: bus.code_writes() };
+    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut(), pred: [0; 2], code_version: bus.code_writes() };
     let f: CodeFn = unsafe { std::mem::transmute(code) };
     let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit, mem.ram_code);
+    if ctx.pred[0] != 0 {
+        let (te, ee) = (ctx.pred[0], ctx.pred[1]);
+        cpu.pred_skips.retain(|&(t, _)| t != te);
+        cpu.pred_skips.push((te, ee));
+    }
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
         let need = (k - 1) + extra;
@@ -372,6 +486,30 @@ fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next
 }
 }
 
+code_abi! {
+/// `R = icfg` (no bus, no ticks: `Cpu::icfg`).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn h_icfg(cpu: *mut Cpu) -> u32 {
+    // SAFETY: cpu is the live Cpu `run` passed in.
+    unsafe { &*cpu }.icfg()
+}
+}
+
+code_abi! {
+/// After `sti` / `icfg = R` (stored by the code): the bus's interrupt window, and leave after
+/// this instruction when that makes the next tick due (what `h_op` gives them).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn h_irq_window<B: Bus>(ctx: *mut Ctx) {
+    // SAFETY: as h_read.
+    let ctx = unsafe { &mut *ctx };
+    let bus = unsafe { &mut *(ctx.bus as *mut B) };
+    bus.irq_window();
+    if bus.next_tick_due() {
+        ctx.brk = 1;
+    }
+}
+}
+
 // Each RAM body owns an immutable snapshot. Even an old incoming chain remains safe
 // after its block has been rebuilt: it must validate the code it actually executes.
 struct RamGuard {
@@ -441,6 +579,14 @@ fn off_hold() -> u32 {
 }
 fn off_pc() -> u32 {
     std::mem::offset_of!(Cpu, pc) as u32
+}
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn off_ie() -> u32 {
+    std::mem::offset_of!(Cpu, ie) as u32
+}
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn off_icfg_store() -> u32 {
+    std::mem::offset_of!(Cpu, sreg_store) as u32
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1186,7 +1332,7 @@ mod tests {
                 ram_code: self.flags.as_ptr(), xip: std::ptr::null(), xip_base: 0x02000000, xip_len: 0 })
         }
     }
-    fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false } }
+    fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false, flags_live: false } }
     fn hot(j: &mut Jit, id: usize, pc: u32, ops: &[BOp], mem: &JitMem) -> *const u8 {
         for _ in 0..HOT { j.entry::<Memory>(id, ops, pc, mem); }
         j.entry::<Memory>(id, ops, pc, mem).unwrap().0
@@ -1246,6 +1392,132 @@ mod tests {
             assert_eq!((cpu.regs, cpu.sp, cpu.rets, cpu.pc), (expected.regs, expected.sp, expected.rets, expected.pc), "{fast:?}");
             assert_eq!(bus.data, reference.data, "{fast:?}");
         }
+    }
+
+    // ---- x86-64: if-else blocks, swapped pairs, the interrupt enables, the indirect-jump cache
+
+    /// An if-else block with its then-part (as `Cpu::native_if_else` brings it): not taken, on at
+    /// the else part; taken, the then-part, then past the else part; alone, a taken one leaves
+    /// with its skip for the interpreter; a then-part left early hands its skip over too.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn if_else_blocks_take_their_skip() {
+        // if (r1 == 5) { r2 = 7; r3 = r3 + 1 } else { 2 bytes }: then 0x02..0x06, else 0x06..0x08
+        let ifb = Fast::IfBlk { a: 1, rk: 1, fam: 0, alt: false, has_else: true, rv: 5, then_d: 4, else_d: 2 };
+        let with_then = [op(ifb), op(Fast::MovI { d: 2, v: 7 }), op(Fast::AddRI { d: 3, s: 3, v: 1 })];
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut j = Jit::new(false).unwrap();
+        let code = hot(&mut j, 0, 0, &with_then, &mem);
+        for (r1, k, pc, r2, r3) in [(5, 3, 8, 7, 11), (4, 1, 6, 0, 10)] {
+            let mut cpu = Cpu::new(0); cpu.regs[1] = r1; cpu.regs[3] = 10;
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, k);
+            assert_eq!((cpu.pc, cpu.regs[2], cpu.regs[3]), (pc, r2, r3));
+            assert!(cpu.pred_skips.is_empty());
+        }
+        // without its then-part: a taken one leaves at it, the skip pending as `exec_fast` leaves it
+        let alone = hot(&mut j, 1, 0, &[op(ifb)], &mem);
+        let mut cpu = Cpu::new(0); cpu.regs[1] = 5;
+        assert_eq!(unsafe { run(alone, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!((cpu.pc, cpu.pred_skips.clone()), (2, vec![(6, 8)]));
+        let mut reference = Cpu::new(0); reference.regs[1] = 5;
+        assert_eq!(reference.exec_fast(&mut Memory::new(), ifb, 2), None);
+        assert_eq!(reference.pred_skips, vec![(6, 8)]);
+        // a then-part left early (a store to a watched word): the skip goes with the exit; left at
+        // its last instruction, the skip is taken
+        cpu.regs[4] = 64;
+        let st = op(Fast::St { s: 0, b: Base::Reg(4), off: 0, w: 4 });
+        let early = hot(&mut j, 2, 0, &[op(ifb), st, op(Fast::MovI { d: 2, v: 7 })], &mem);
+        let mut cpu = Cpu::new(0); cpu.regs[1] = 5; cpu.regs[4] = 64;
+        assert_eq!(unsafe { run(early, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!((cpu.pc, cpu.regs[2], cpu.pred_skips.clone()), (4, 0, vec![(6, 8)]));
+        let last = hot(&mut j, 3, 0, &[op(ifb), op(Fast::MovI { d: 2, v: 7 }), st], &mem);
+        let mut cpu = Cpu::new(0); cpu.regs[1] = 5; cpu.regs[4] = 64;
+        assert_eq!(unsafe { run(last, &mut cpu, &mut bus, &mem, 0, 10) }.0, 3);
+        assert_eq!((cpu.pc, cpu.regs[2]), (8, 7));
+        assert!(cpu.pred_skips.is_empty());
+    }
+
+    /// Dual-issue pairs compiled second first give the pair rule (`exec_fast_paired`); a pair
+    /// whose second writes a register its head reads is not compiled.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn swapped_pairs_match_the_pair_rule() {
+        let head = |fast| BOp { fast, len: 2, careful: true, pair_head: true, glue: false, flags_live: false };
+        let pairs = [
+            (Fast::Mov { d: 1, s: 0 }, Fast::LdBu { d: 2, b: 1, off: 0 }),
+            (Fast::AddRI { d: 3, s: 5, v: 32 }, Fast::StW { s: 5, b: 3, off: 8 }),
+            (Fast::MovI { d: 4, v: 31588 }, Fast::StW { s: 4, b: 0, off: 0 }),
+            (Fast::A4 { d: 1, s: 5, op: crate::Op::Mul, rk: 1, rv: 12 }, Fast::StW { s: 6, b: 1, off: 12 }),
+            (Fast::Alu2 { d: 1, b: 3, op: crate::Op::Add }, Fast::Mov { d: 2, s: 1 }),
+        ];
+        let mut j = Jit::new(false).unwrap();
+        for (id, &(a, b)) in pairs.iter().enumerate() {
+            let mut bus = Memory::new(); let mut reference = Memory::new();
+            for i in 0..256 { bus.data[i] = i as u8; reference.data[i] = i as u8; }
+            let mem = bus.jit_mem().unwrap();
+            let mut cpu = Cpu::new(0);
+            cpu.regs = [16, 20, 24, 28, 32, 36, 40, 44, 0, 0, 0, 0, 0, 0, 0, 0];
+            let mut expected = Cpu::new(0); expected.regs = cpu.regs;
+            expected.exec_fast_paired(&mut reference, a, true, 2);
+            expected.exec_fast_paired(&mut reference, b, false, 4);
+            let ops = [head(a), op(b)];
+            assert_eq!(compilable_prefix(&ops), 2, "{a:?} {b:?}");
+            let code = hot(&mut j, id, 0, &ops, &mem);
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2, "{a:?} {b:?}");
+            assert_eq!((cpu.regs, cpu.pc), (expected.regs, 4), "{a:?} {b:?}");
+            assert_eq!(bus.data, reference.data, "{a:?} {b:?}");
+        }
+        // (the second writes the head's source: no swap, no compiling past the head)
+        assert_eq!(compilable_prefix(&[head(Fast::Mov { d: 1, s: 0 }), op(Fast::MovI { d: 0, v: 1 })]), 0);
+        // (the head reads memory: no swap)
+        assert_eq!(compilable_prefix(&[head(Fast::LdBu { d: 1, b: 0, off: 0 }), op(Fast::MovI { d: 2, v: 1 })]), 0);
+    }
+
+    /// cli / sti / icfg reads and writes compiled as the interpreter runs them.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn interrupt_enables_match_interpreter() {
+        let mut j = Jit::new(false).unwrap();
+        let cases = [Fast::SetIe { on: true }, Fast::SetIe { on: false }, Fast::IcfgRd { d: 3 }, Fast::IcfgWr { s: 2 }];
+        for (id, &fast) in cases.iter().enumerate() {
+            for (ie, levels) in [(false, vec![]), (true, vec![2u8, 5])] {
+                let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+                let mut cpu = Cpu::new(0);
+                cpu.ie = ie; cpu.irq_levels = levels.clone(); cpu.sreg_store[0] = 0x1234_5f00; cpu.regs[2] = 0xabcd_0300;
+                let mut expected = Cpu::new(0);
+                expected.ie = ie; expected.irq_levels = levels; expected.sreg_store = cpu.sreg_store; expected.regs = cpu.regs;
+                expected.exec_fast(&mut Memory::new(), fast, 2);
+                let code = hot(&mut j, id, 0, &[op(fast)], &mem);
+                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1, "{fast:?}");
+                assert_eq!((cpu.regs, cpu.ie, cpu.sreg_store, cpu.pc), (expected.regs, expected.ie, expected.sreg_store, 2), "{fast:?}");
+            }
+        }
+    }
+
+    /// A return goes straight into the block it returns to once the indirect-jump cache has it;
+    /// that block still finds the call's limit spent when it is (as a chained one does).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn returns_go_through_the_indirect_jump_cache() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut j = Jit::new(false).unwrap();
+        let ret = hot(&mut j, 0, 0, &[op(Fast::Rts)], &mem);
+        hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 })], &mem);
+        let mut cpu = Cpu::new(0); cpu.rets = 32;
+        assert_eq!(unsafe { run(ret, &mut cpu, &mut bus, &mem, 0, 10) }, (1, std::ptr::null_mut()));
+        assert_eq!((cpu.pc, cpu.regs[0]), (32, 0));
+        j.itab_put(32, j.body(1).unwrap());
+        assert_eq!(unsafe { run(ret, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!((cpu.pc, cpu.regs[0]), (34, 42));
+        cpu.regs[0] = 0;
+        assert_eq!(unsafe { run(ret, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1);
+        assert_eq!((cpu.pc, cpu.regs[0]), (32, 0));
+        // (a tag that is not the pc: a miss)
+        j.itab_put(32 + (2 << ITAB_BITS), j.body(1).unwrap());
+        assert_eq!(unsafe { run(ret, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(cpu.pc, 32);
+        j.reset();
+        assert!(j.itab.iter().all(|e| e.tag == 1));
     }
 
     /// Every micro-op the compilers emit inline (and some through the executor), each alone in a block, from random registers
