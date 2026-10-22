@@ -78,9 +78,11 @@ stays a thin layer.
 
 ## Known Windows differences (polish list)
 
-- **No JIT on x86-64.** Upstream compiles hot code to AArch64 only; Windows runs the interpreter
-  (about 2.8× real time for FM-1 SID on a 2.1 GHz Xeon; heavy grooveboxes have less headroom).
-  An x86-64 JIT would be an upstream contribution.
+- **The JIT on Windows.** Upstream compiles hot code to x86-64 since 21 Oct 2026 (`jit/x64.rs`);
+  branch `x64-jit-coverage` here (offered upstream) keeps compiled code running through returns,
+  if-else blocks, dual-issue pairs and critical sections: busy firmwares went from ~1.1-1.5x to
+  ~1.6-2.3x real time on a 2.1 GHz Xeon, audio bit-identical to the interpreter (checked on every
+  package of both catalogs). `FM1_NO_JIT=1` runs the interpreter, to compare.
 - **No thread priority boost.** `high_priority()` in `crates/fm1-live/src/main.rs` only does
   something on macOS; a Windows `SetThreadPriority` / MMCSS version would help against crackles.
 - **`tools/fetch_firmwares.mjs`** builds paths with `URL.pathname` (`/C:/…`), which breaks on
