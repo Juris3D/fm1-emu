@@ -867,6 +867,9 @@ fn main() {
     win.set_target_fps(60);
     let base = panel::base();
     let mut buf = vec![0u32; W * H];
+    // the screen as last delivered, copied out so the panel is drawn without holding `lcd`
+    // (the emulator thread waits on that lock to deliver the next one)
+    let mut fb = vec![0u16; 240 * 240];
     let mut down = [false; 41];
     let mut enc_clicks = [0i32; 7];
     let mut turning = [0u32; 8];
@@ -990,8 +993,8 @@ fn main() {
                 shown_leds[i] = l[i].max(shown_leds[i] * 0.8);
             }
         }
+        fb.copy_from_slice(&lcd.lock().unwrap());
         {
-            let fb = lcd.lock().unwrap();
             let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
             panel::draw(&mut buf, &base, &st);
         }
@@ -1020,6 +1023,8 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
     win.set_target_fps(60);
     let base = panel_smk::base();
     let mut buf = vec![0u32; w * h];
+    // (as the FM-1's window: the screen copied out, the panel drawn without holding `lcd`)
+    let mut fb = vec![0u16; 240 * 240];
     let btn0 = fm1_soc::smk::BTN0;
     let (mut down, mut enc_clicks, mut turning) = ([false; 64], [0i32; 8], [0u32; 8]);
     let mut analog = [0u16; 23];
@@ -1145,8 +1150,8 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
         for t in turning.iter_mut() {
             *t = t.saturating_sub(1);
         }
+        fb.copy_from_slice(&lcd.lock().unwrap());
         {
-            let fb = lcd.lock().unwrap();
             let l = *leds.lock().unwrap();
             let pc = *pads.lock().unwrap();
             let st = panel_smk::State {
