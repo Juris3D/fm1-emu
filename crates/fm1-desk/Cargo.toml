@@ -5,6 +5,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+build = "build.rs"
+
 [[bin]]
 name = "fm1-desk"
 path = "src/main.rs"
@@ -22,6 +24,10 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
+
+# the icon and version information in the .exe
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 # Its own workspace, as crates/fm1-plugin: the GUI's dependencies stay out of the emulator's
 # builds and CI, and upstream's Cargo.toml / Cargo.lock are not touched.

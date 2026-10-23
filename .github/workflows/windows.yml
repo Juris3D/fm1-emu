@@ -79,11 +79,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: windows
       - uses: actions/download-artifact@v4
         with:
           name: fm1-emu-windows-x64
           path: dist
+      # the shareable zip only (the app, its readme, the licence), with windows/RELEASE-NOTES.md
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --title "Windows build $GITHUB_REF_NAME" --notes "fm1-emu for Windows 10/11 x64, FM-1 and SMK-37. Unzip, run Start.cmd."
+        run: |
+          zip=$(ls dist/FM-1-SMK-37-Desk-*-windows-x64.zip)
+          v=${GITHUB_REF_NAME#win-v}
+          gh release create "$GITHUB_REF_NAME" "$zip" --repo "$GITHUB_REPOSITORY" \
+            --title "FM-1 SMK-37 Desk $v" --notes-file windows/RELEASE-NOTES.md

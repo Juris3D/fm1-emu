@@ -66,6 +66,8 @@ struct Fm1Input {
     last_y: f32,
     drag_acc: f32,
     pot: u16,
+    /// the key under the mouse: how hard (its height; lower = harder)
+    mouse_vel: u8,
 }
 
 /// The SMK-37's (fm1-live's `window_smk` state).
@@ -82,7 +84,7 @@ struct SmkInput {
 
 impl Fm1Input {
     fn new(pot: u16) -> Self {
-        Fm1Input { down: [false; 41], enc_clicks: [0; 7], turning: [0; 8], scroll_acc: [0.0; 8], shown_leds: [0.0; 41], grab: None, last_y: 0.0, drag_acc: 0.0, pot }
+        Fm1Input { down: [false; 41], enc_clicks: [0; 7], turning: [0; 8], scroll_acc: [0.0; 8], shown_leds: [0.0; 41], grab: None, last_y: 0.0, drag_acc: 0.0, pot, mouse_vel: 0 }
     }
 }
 
@@ -421,11 +423,23 @@ impl Desk {
                 s.grab = panel::hit(mx, my);
                 s.last_y = my;
                 s.drag_acc = 0.0;
+                if let Some(panel::Ctl::Key(k)) = s.grab {
+                    s.mouse_vel = panel::key_vel(k, my);
+                }
             } else if f.down {
                 match s.grab {
-                    Some(panel::Ctl::Key(_)) => {
+                    // glissando: the held note follows the pointer across keys; on the same key,
+                    // its height is the pressure (aftertouch)
+                    Some(panel::Ctl::Key(k0)) => {
                         if let Some(panel::Ctl::Key(k)) = panel::hit(mx, my) {
-                            s.grab = Some(panel::Ctl::Key(k));
+                            let v = panel::key_vel(k, my);
+                            if k != k0 {
+                                s.grab = Some(panel::Ctl::Key(k));
+                                s.mouse_vel = v;
+                            } else if v.abs_diff(s.mouse_vel) >= 4 {
+                                s.mouse_vel = v;
+                                send(Action::Pressure { id: k, vel: v });
+                            }
                         }
                     }
                     Some(panel::Ctl::Enc(i)) => {
@@ -488,6 +502,11 @@ impl Desk {
         for id in 0..41 {
             if want[id] != s.down[id] {
                 s.down[id] = want[id];
+                if want[id] && id >= 14 {
+                    // the mouse's key at its height, the computer keyboard's at 100
+                    let mouse = matches!(s.grab, Some(panel::Ctl::Key(k)) if k as usize == id);
+                    send(Action::KeyVel { vel: if mouse { s.mouse_vel } else { 100 } });
+                }
                 send(Action::Key { id: id as u8, down: want[id] });
             }
         }
@@ -714,6 +733,7 @@ impl Desk {
                 self.focus_search = false;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak()).on_hover_text(format!("Files: {}", self.store.root.display()));
                 if self.running.is_some() && ui.button(RichText::new("Back to playing  (Esc)").size(16.0)).clicked() {
                     self.picker = false;
                 }

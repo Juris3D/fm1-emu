@@ -42,4 +42,18 @@ if ($Package) {
     if (Test-Path $zip) { Remove-Item $zip }
     Compress-Archive -Path "$stage\*" -DestinationPath $zip
     Write-Host "packaged: $zip"
+
+    # the shareable one: the app, its readme and the licence, in one folder
+    $dv = (Select-String -Path crates\fm1-desk\Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+    $name = "FM-1 SMK-37 Desk"
+    $share = Join-Path $Root "dist\share\$name"
+    if (Test-Path (Join-Path $Root "dist\share")) { Remove-Item (Join-Path $Root "dist\share") -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $share | Out-Null
+    Copy-Item crates\fm1-desk\target\release\fm1-desk.exe (Join-Path $share "$name.exe")
+    Copy-Item windows\SHARE-README.txt (Join-Path $share "README.txt")
+    Copy-Item LICENSE (Join-Path $share "LICENSE.txt")
+    $szip = Join-Path $Root "dist\FM-1-SMK-37-Desk-$dv-windows-x64.zip"
+    if (Test-Path $szip) { Remove-Item $szip }
+    Compress-Archive -Path $share -DestinationPath $szip
+    Write-Host "packaged: $szip"
 }

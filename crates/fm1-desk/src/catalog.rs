@@ -146,9 +146,21 @@ pub struct Store {
 impl Store {
     /// The app's folder: the executable's, or its parent when that is `bin` (the zip's layout:
     /// Start.cmd, firmwares\, bin\fm1-desk.exe).
+    /// A folder it cannot write to (Program Files, a read-only share): the user's own app-data
+    /// folder instead (%LOCALAPPDATA%\FM-1 SMK-37 Desk on Windows).
     pub fn here() -> Store {
         let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
         let root = if exe.file_name().is_some_and(|n| n.eq_ignore_ascii_case("bin")) { exe.parent().unwrap_or(&exe).to_path_buf() } else { exe };
+        if writable(&root) {
+            return Store { root };
+        }
+        let base = std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("XDG_DATA_HOME"))
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join("FM-1 SMK-37 Desk");
+        let _ = std::fs::create_dir_all(&root);
         Store { root }
     }
 
@@ -233,6 +245,14 @@ impl Store {
         std::fs::write(dir.join("index.json"), text + "\n").map_err(|err| err.to_string())?;
         Ok(dir.join(file))
     }
+}
+
+/// Can files be made in `dir`?
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(".fm1-desk-write-test");
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
 }
 
 /// A file name from an id (ids are plain, but never trust a list with paths).

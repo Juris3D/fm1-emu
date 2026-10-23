@@ -183,6 +183,7 @@ impl Machine {
         let params = RAM_BASE + 0x7fc00;
         soc.write32(params, params + 0x40);
         cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
+        soc.sfc_boot(st.key, st.app_end);
         if let Some(f) = flash.filter(|f| f.len() == fm1_soc::FLASH_SIZE) {
             soc.restore_flash(f);
         }
