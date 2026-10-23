@@ -33,6 +33,11 @@ settings) to `saves\`, so it is there next time; the app's own settings to `fm1-
 | `1`…`8` (`9 0`) | buttons | top row of pads |
 | `←→` `↓↑` `,.` | encoders | K1, K2, K3 |
 | `F1` / `Esc` | picker / back | picker / back |
+| `F2` | Library strip | Library strip |
+
+That is the Ableton layout; ⚙ Settings also has the FL Studio / tracker one (Z X C V … and
+Q W E R …, two octaves; - / = octave, Enter REC, F3…F12 buttons / pads) and shows the letters
+on the panel's keys.
 
 The mouse works on the drawn panel: click or drag across keys, drag or scroll knobs, drag faders
 and wheels. Any MIDI keyboard plays it. If the sound crackles, the CPU can't keep up: lower the

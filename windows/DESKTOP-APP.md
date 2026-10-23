@@ -3,7 +3,10 @@
 **State (23 Oct 2026):** first version built: `crates/fm1-desk` (FM-1 · SMK-37 Desk): play mode,
 picker over the panel (tabs, search, statuses, downloads, update all, own .fwsc), lists fetched
 from upstream with the built-in ones as fallback, flash saved per firmware, window fitted to
-each board's panel. Still to do: the app's own update check, and the "big screen" layout.
+each board's panel. 0.2 (24 Oct, a friend's requests): the computer keyboard in Ableton or
+FL / tracker layout with its letters on the keys; the Library strip (F2), Kontakt-like: both
+boards as pictures, the firmwares here as tiles of their screens (the playing one live), the
+last played first. Still to do: the app's own update check, and the "big screen" layout.
 
 The goal: one Windows `.exe` for both boards, with no Node.js and no console. The emulator is already one
 program for both: a package says which board it runs on, and the panel follows it.

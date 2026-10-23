@@ -6,6 +6,7 @@ Download **FM-1-SMK-37-Desk-…-windows-x64.zip** below, unzip it somewhere you 
 - The community firmwares of both, listed with their descriptions; one click downloads and plays one
 - **F1** brings the list over the synth; **Esc** goes back. Firmware updates are found and fetched there
 - Mouse, computer keyboard and any MIDI keyboard play it; each firmware's saved patches and settings are kept
+- **New in 0.2:** the computer keyboard in two layouts, Ableton or FL Studio / tracker (two octaves), with the letters shown on the keys if you like (⚙ Settings); **F2** opens the Library: both synths and your firmwares as pictures of their screens, the last played first, one click to switch
 
 Windows 10 / 11, 64-bit. The `README.txt` inside has the keys and the details.
 

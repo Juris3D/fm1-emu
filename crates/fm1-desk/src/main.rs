@@ -16,6 +16,7 @@ mod panel_smk;
 mod app;
 mod catalog;
 mod engine;
+mod keys;
 
 fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--version" || a == "-V") {

@@ -3,6 +3,7 @@
 
 use crate::catalog::{BoardId, Catalog, Entry, Local, Source, Status, Store};
 use crate::engine::{self, Audio, Midi, Session};
+use crate::keys::{self, Layout};
 use crate::{panel, panel_smk};
 use eframe::egui::{self, Color32, Key, RichText};
 use fm1_soc::Action;
@@ -18,6 +19,8 @@ const DRAG_PER_CLICK: f32 = 12.0;
 /// Scroll distance per wheel notch, in points (egui's line height for a wheel step).
 const NOTCH: f32 = 50.0;
 const CLOCKS: [u64; 5] = [240, 200, 160, 120, 96];
+/// The Library strip's width.
+const LIBRARY_W: f32 = 236.0;
 
 // ------------------------------------------------------------------ settings
 
@@ -31,11 +34,18 @@ struct Settings {
     own: BTreeMap<String, String>,
     mhz: u64,
     midi: String,
+    /// the computer keyboard's layout, and its letters drawn on the panel's keys
+    keys: Layout,
+    hints: bool,
+    /// the Library strip on the left (F2)
+    library: bool,
+    /// firmwares played, the last first ("<board>/<id>")
+    recent: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { board: BoardId::Fm1, last: BTreeMap::new(), own: BTreeMap::new(), mhz: 240, midi: "all".into() }
+        Settings { board: BoardId::Fm1, last: BTreeMap::new(), own: BTreeMap::new(), mhz: 240, midi: "all".into(), keys: Layout::Ableton, hints: false, library: false, recent: Vec::new() }
     }
 }
 
@@ -165,6 +175,11 @@ pub struct Desk {
     message: Option<(String, Instant)>,
     title: String,
     ctx: egui::Context,
+    // the Library strip
+    board_tex: HashMap<BoardId, egui::TextureHandle>,
+    thumbs: HashMap<String, Option<egui::TextureHandle>>,
+    live_tex: Option<egui::TextureHandle>,
+    live_at: Instant,
 }
 
 impl Desk {
@@ -216,6 +231,10 @@ impl Desk {
             message: None,
             title: String::new(),
             ctx: cc.egui_ctx.clone(),
+            board_tex: HashMap::new(),
+            thumbs: HashMap::new(),
+            live_tex: None,
+            live_at: Instant::now(),
         };
         if let Some(e) = desk.audio.error.clone() {
             desk.say(format!("no sound: {e}"));
@@ -272,6 +291,7 @@ impl Desk {
             Err(e) => return self.say(format!("{}: {e}", path.display())),
         };
         if let Some(r) = self.running.take() {
+            self.snapshot(&r);
             r.session.stop(&self.midi);
         }
         let save = self.store.save_path(b, &id.replace("own:", "own-"));
@@ -285,6 +305,10 @@ impl Desk {
                 let board = BoardId::of(s.board);
                 self.running = Some(Running { session: s, board, id: id.clone(), name, version, started: Instant::now() });
                 self.settings.board = board;
+                let key = format!("{}/{id}", board.dir());
+                self.settings.recent.retain(|k| *k != key);
+                self.settings.recent.insert(0, key);
+                self.settings.recent.truncate(60);
                 self.settings.last.insert(board.dir().into(), id);
                 self.settings.save(&self.store);
                 self.picker = false;
@@ -411,6 +435,7 @@ impl Desk {
 
     /// fm1-live's FM-1 window loop, one frame.
     fn fm1_frame(&mut self, f: &Frame) {
+        let layout = self.settings.keys;
         let (Some(r), Input::Fm1(s)) = (&self.running, &mut self.input) else { return };
         let send = |a: Action| r.session.send(a);
         let turn = |s: &mut Fm1Input, i: usize, clicks: i32| {
@@ -492,7 +517,7 @@ impl Desk {
         }
         let mut want = [false; 41];
         for k in &f.keys {
-            if let Some(id) = piano(*k).or_else(|| button(*k)) {
+            if let Some(id) = keys::fm1_note(layout, *k).or_else(|| keys::fm1_button(layout, *k)) {
                 want[id as usize] = true;
             }
         }
@@ -511,14 +536,8 @@ impl Desk {
             }
         }
         for k in &f.pressed {
-            match k {
-                Key::ArrowLeft => turn(s, 0, -1),
-                Key::ArrowRight => turn(s, 0, 1),
-                Key::ArrowDown => turn(s, 1, -1),
-                Key::ArrowUp => turn(s, 1, 1),
-                Key::Comma => turn(s, 2, -1),
-                Key::Period => turn(s, 2, 1),
-                _ => {}
+            if let Some((i, d)) = keys::encoder(layout, *k) {
+                turn(s, i, d);
             }
         }
         for t in s.turning.iter_mut() {
@@ -530,6 +549,7 @@ impl Desk {
     fn smk_frame(&mut self, f: &Frame) {
         use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH, BTN0, PITCH_REST};
         use panel_smk::Ctl as S;
+        let layout = self.settings.keys;
         let (Some(r), Input::Smk(s)) = (&self.running, &mut self.input) else { return };
         let send = |a: Action| r.session.send(a);
         let set_analog = |s: &mut SmkInput, i: usize, v: u16| {
@@ -609,20 +629,13 @@ impl Desk {
         let mut want = [false; 64];
         let mut pad_keys = [false; 8];
         for k in &f.keys {
-            if let Some(id) = piano(*k) {
-                want[(id - 21 + 12) as usize] = true; // (piano() gives the FM-1's ids, C4 = 21)
+            if let Some(id) = keys::smk_note(layout, *k) {
+                want[id as usize] = true;
             }
-            let b = match k {
-                Key::Z => Some(4),
-                Key::X => Some(5),
-                Key::Space => Some(16),
-                Key::R => Some(17),
-                _ => None,
-            };
-            if let Some(b) = b {
+            if let Some(b) = keys::smk_button(layout, *k) {
                 want[(BTN0 + b) as usize] = true;
             }
-            if let Some(p) = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8].iter().position(|p| p == k) {
+            if let Some(p) = keys::smk_pad(layout, *k) {
                 pad_keys[p] = true;
             }
         }
@@ -644,14 +657,8 @@ impl Desk {
             }
         }
         for k in &f.pressed {
-            match k {
-                Key::ArrowLeft => turn(s, 0, -1),
-                Key::ArrowRight => turn(s, 0, 1),
-                Key::ArrowDown => turn(s, 1, -1),
-                Key::ArrowUp => turn(s, 1, 1),
-                Key::Comma => turn(s, 2, -1),
-                Key::Period => turn(s, 2, 1),
-                _ => {}
+            if let Some((i, d)) = keys::encoder(layout, *k) {
+                turn(s, i, d);
             }
         }
         for t in s.turning.iter_mut() {
@@ -903,6 +910,9 @@ impl Desk {
             if ui.button(RichText::new("☰  Firmware  (F1)").size(15.0)).clicked() {
                 self.open_picker();
             }
+            if ui.selectable_label(self.settings.library, RichText::new("▤  Library  (F2)").size(15.0)).clicked() {
+                self.toggle_library();
+            }
             if let Some(r) = &self.running {
                 ui.label(RichText::new(format!("{}  ·  {} {}", r.board.name(), r.name, r.version)).strong());
                 let s = r.session.shared.stats.lock().unwrap().clone();
@@ -916,36 +926,63 @@ impl Desk {
                 ui.label(RichText::new("nothing playing").weak());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // MIDI in
-                let mut choice = self.settings.midi.clone();
-                egui::ComboBox::from_id_salt("midi").selected_text(format!("MIDI: {}", short(&choice))).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut choice, "all".to_string(), "all inputs");
-                    ui.selectable_value(&mut choice, "none".to_string(), "none");
-                    for p in &self.midi_ports {
-                        ui.selectable_value(&mut choice, p.clone(), p);
-                    }
-                });
-                if choice != self.settings.midi {
-                    // (the inputs feed whatever plays: the running synth stays plugged in)
-                    self.settings.midi = choice.clone();
-                    self.midi.connect(&choice);
-                    self.settings.save(&self.store);
-                }
-                // clock
-                let mut mhz = self.settings.mhz;
-                egui::ComboBox::from_id_salt("clock").selected_text(format!("{mhz} MHz")).show_ui(ui, |ui| {
-                    for c in CLOCKS {
-                        let label = if c == 240 { "240 MHz (the real chip)".to_string() } else { format!("{c} MHz") };
-                        ui.selectable_value(&mut mhz, c, label);
-                    }
-                });
-                if mhz != self.settings.mhz {
-                    self.settings.mhz = mhz;
-                    self.settings.save(&self.store);
-                    self.restart();
+                ui.menu_button(RichText::new("⚙  Settings").size(15.0), |ui| self.settings_menu(ui));
+                if self.settings.hints {
+                    ui.label(RichText::new(format!("keys: {}", self.settings.keys.name())).weak());
                 }
             });
         });
+    }
+
+    /// Clock, MIDI input, the computer keyboard's layout and its letters on the keys.
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(330.0);
+        ui.label(RichText::new("Computer keyboard").strong());
+        let mut layout = self.settings.keys;
+        ui.radio_value(&mut layout, Layout::Ableton, "Ableton: A S D F … white, W E T … black (from C4)")
+            .on_hover_text("Z / X octave, Space PLAY, R REC, 1…0 the buttons (SMK-37: 1…8 the pads), arrows and , . the encoders");
+        ui.radio_value(&mut layout, Layout::Tracker, "FL Studio / tracker: Z X C V … and Q W E R …, two octaves")
+            .on_hover_text("- / = octave, Space PLAY, Enter REC, F3…F12 the buttons (SMK-37: F3…F10 the pads), arrows and Page Up / Down the encoders");
+        let mut hints = self.settings.hints;
+        ui.checkbox(&mut hints, "Show the letters on the keys");
+        if layout != self.settings.keys || hints != self.settings.hints {
+            self.release_all();
+            self.settings.keys = layout;
+            self.settings.hints = hints;
+            self.settings.save(&self.store);
+        }
+        ui.separator();
+        ui.label(RichText::new("Clock").strong());
+        let mut mhz = self.settings.mhz;
+        ui.horizontal_wrapped(|ui| {
+            for c in CLOCKS {
+                ui.radio_value(&mut mhz, c, format!("{c} MHz"));
+            }
+        });
+        ui.label(RichText::new("240 MHz is the real chip; lower it if the sound crackles.").size(12.5).weak());
+        if mhz != self.settings.mhz {
+            self.settings.mhz = mhz;
+            self.settings.save(&self.store);
+            self.restart();
+        }
+        ui.separator();
+        ui.label(RichText::new("MIDI input").strong());
+        let mut choice = self.settings.midi.clone();
+        ui.radio_value(&mut choice, "all".to_string(), "all inputs");
+        ui.radio_value(&mut choice, "none".to_string(), "none");
+        for p in &self.midi_ports {
+            ui.radio_value(&mut choice, p.clone(), p);
+        }
+        if ui.small_button("look for inputs again").clicked() {
+            self.midi_ports = Midi::list();
+            self.midi.connect(&self.settings.midi);
+        }
+        if choice != self.settings.midi {
+            // (the inputs feed whatever plays: the running synth stays plugged in)
+            self.settings.midi = choice.clone();
+            self.midi.connect(&choice);
+            self.settings.save(&self.store);
+        }
     }
 
     /// The running firmware again (a new clock or MIDI choice); its flash is kept across.
@@ -960,7 +997,8 @@ impl Desk {
     fn fit_window(&self) {
         let (w, h) = self.panel_size();
         let width = self.ctx.input(|i| i.viewport().inner_rect.map(|r| r.width())).unwrap_or(1280.0);
-        let height = (width * h as f32 / w as f32 + 38.0).round();
+        let strip = if self.settings.library { LIBRARY_W } else { 0.0 };
+        let height = ((width - strip).max(320.0) * h as f32 / w as f32 + 38.0).round();
         self.ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
     }
 
@@ -995,6 +1033,192 @@ impl Desk {
         }
     }
 
+    fn toggle_library(&mut self) {
+        self.settings.library = !self.settings.library;
+        self.settings.save(&self.store);
+    }
+
+    /// The computer key's letters on each note key of the panel, on a small dark chip.
+    fn key_letters(&self, p: &egui::Painter, rect: egui::Rect) {
+        let (w, h) = self.panel_size();
+        let smk = matches!(self.input, Input::Smk(_));
+        let s = rect.width() / w as f32;
+        let _ = h; // (the panel keeps its aspect: one scale for both)
+        let list = if smk { panel_smk::keys() } else { panel::keys() };
+        let font = egui::FontId::monospace((15.0 * s * if smk { 1.2 } else { 1.4 }).max(9.0));
+        for (id, x, y, kw, kh, black) in list {
+            let t = keys::label(self.settings.keys, smk, id);
+            if t.is_empty() {
+                continue;
+            }
+            let g = p.layout_no_wrap(t, font.clone(), Color32::WHITE);
+            let cx = rect.min.x + (x as f32 + kw as f32 / 2.0) * s;
+            let by = rect.min.y + (y as f32 + kh as f32 * if black { 0.78 } else { 0.86 }) * s;
+            let r = egui::Rect::from_center_size(egui::pos2(cx, by), g.size() + egui::vec2(8.0, 3.0));
+            p.rect_filled(r, 4.0, Color32::from_black_alpha(170));
+            p.galley(r.min + egui::vec2(4.0, 1.5), g, Color32::WHITE);
+        }
+    }
+
+    /// The playing firmware's screen kept for its Library tile.
+    fn snapshot(&mut self, r: &Running) {
+        let lcd = r.session.shared.lcd.lock().unwrap().clone();
+        if lcd.iter().all(|&p| p == 0) {
+            return;
+        }
+        let path = self.store.snap_path(r.board, &r.id.replace("own:", "own-"));
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let bytes: Vec<u8> = lcd.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let _ = std::fs::write(&path, bytes);
+        self.thumbs.remove(&format!("{}/{}", r.board.dir(), r.id));
+    }
+
+    /// A 240 x 240 RGB565 screen as an image.
+    fn lcd_image(lcd: &[u16]) -> egui::ColorImage {
+        let pixels = lcd
+            .iter()
+            .map(|&p| {
+                let p = p as u32;
+                Color32::from_rgb(((p >> 11) * 255 / 31) as u8, (((p >> 5) & 63) * 255 / 63) as u8, ((p & 31) * 255 / 31) as u8)
+            })
+            .collect();
+        egui::ColorImage { size: [240, 240], pixels }
+    }
+
+    /// The strip on the left: both boards, and the firmwares on this computer as tiles of their
+    /// screens (the playing one live), the last played first.
+    fn library_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // the playing firmware's screen, live (ten times a second)
+        if self.running.is_some() && self.live_at.elapsed() > Duration::from_millis(100) {
+            let img = Self::lcd_image(&self.fb);
+            match &mut self.live_tex {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => self.live_tex = Some(ctx.load_texture("live", img, egui::TextureOptions::LINEAR)),
+            }
+            self.live_at = Instant::now();
+        }
+        ui.label(RichText::new("Library").size(20.0).strong());
+        ui.add_space(4.0);
+        let mut play: Option<(BoardId, String)> = None;
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            for b in BoardId::ALL {
+                // the board, as its panel looks
+                let tex = self.board_tex.entry(b).or_insert_with(|| {
+                    // (the panel at rest: its knobs, keys and a dark screen)
+                    let lcd = vec![0u16; 240 * 240];
+                    let (w, h, buf) = match b {
+                        BoardId::Fm1 => {
+                            let mut buf = vec![0u32; panel::W * panel::H];
+                            let st = panel::State { lcd: &lcd, enc_clicks: &[0; 7], pot: 600, down: &[false; 41], leds: &[0.0; 41], turning: &[0; 8] };
+                            panel::draw(&mut buf, base_fm1(), &st);
+                            (panel::W, panel::H, buf)
+                        }
+                        BoardId::Smk37 => {
+                            use fm1_soc::smk::{MOD_REST, PITCH_REST};
+                            let mut buf = vec![0u32; panel_smk::W * panel_smk::H];
+                            let st = panel_smk::State {
+                                lcd: &lcd,
+                                enc_clicks: &[0; 8],
+                                turning: &[0; 8],
+                                down: &[false; 64],
+                                leds: &std::array::from_fn(|_| 0.0),
+                                pads: &[0; 16],
+                                pad_force: &std::array::from_fn(|_| 0),
+                                faders: &std::array::from_fn(|_| 0),
+                                pitch: PITCH_REST,
+                                modw: MOD_REST,
+                            };
+                            panel_smk::draw(&mut buf, base_smk(), &st);
+                            (panel_smk::W, panel_smk::H, buf)
+                        }
+                    };
+                    let pixels = buf.iter().map(|&p| Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, p as u8)).collect();
+                    ctx.load_texture(format!("board-{}", b.dir()), egui::ColorImage { size: [w, h], pixels }, egui::TextureOptions::LINEAR)
+                });
+                let aspect = tex.size()[1] as f32 / tex.size()[0] as f32;
+                let width = ui.available_width();
+                ui.add(egui::Image::new((tex.id(), egui::vec2(width, width * aspect))).corner_radius(6.0));
+                ui.label(RichText::new(b.name()).size(16.0).strong());
+                // its firmwares here, the last played first
+                let l = &self.lists[&b];
+                let mut ids: Vec<(usize, String, String, String)> = l
+                    .locals
+                    .iter()
+                    .map(|(id, loc)| {
+                        let key = format!("{}/{id}", b.dir());
+                        let rank = self.settings.recent.iter().position(|k| *k == key).unwrap_or(usize::MAX);
+                        let name = l.cat.firmwares.iter().find(|e| &e.id == id).map(|e| e.name.clone()).unwrap_or_else(|| loc.name.clone());
+                        (rank, name, loc.version.clone(), id.clone())
+                    })
+                    .collect();
+                ids.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+                if ids.is_empty() {
+                    ui.label(RichText::new("none downloaded yet (F1)").size(13.0).weak());
+                }
+                for (_, name, version, id) in ids {
+                    let key = format!("{}/{id}", b.dir());
+                    let playing = self.running.as_ref().is_some_and(|r| r.board == b && r.id == id);
+                    let thumb = if playing {
+                        self.live_tex.as_ref().map(|t| t.id())
+                    } else {
+                        let path = self.store.snap_path(b, &id);
+                        self.thumbs
+                            .entry(key.clone())
+                            .or_insert_with(|| {
+                                let bytes = std::fs::read(&path).ok().filter(|v| v.len() == 240 * 240 * 2)?;
+                                let lcd: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                                Some(ctx.load_texture(format!("thumb-{key}"), Self::lcd_image(&lcd), egui::TextureOptions::LINEAR))
+                            })
+                            .as_ref()
+                            .map(|t| t.id())
+                    };
+                    let fill = if playing { Color32::from_rgb(34, 52, 70) } else { Color32::from_rgb(32, 34, 38) };
+                    let resp = egui::Frame::new().fill(fill).corner_radius(6.0).inner_margin(egui::Margin::same(5)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let size = egui::vec2(52.0, 52.0);
+                            match thumb {
+                                Some(t) => {
+                                    ui.add(egui::Image::new((t, size)).corner_radius(4.0));
+                                }
+                                None => {
+                                    // (never played here yet: its initials)
+                                    let (r, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                    ui.painter().rect_filled(r, 4.0, Color32::from_rgb(52, 56, 64));
+                                    let ini: String = name.chars().filter(|c| c.is_alphanumeric()).take(2).collect();
+                                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, ini, egui::FontId::proportional(18.0), Color32::from_gray(200));
+                                }
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&name).size(14.5).strong().color(Color32::WHITE));
+                                let v = if playing { format!("{version}  ▶") } else { version.clone() };
+                                ui.label(RichText::new(v).size(12.5).weak());
+                            });
+                        });
+                    });
+                    let click = ui.interact(resp.response.rect, ui.id().with(("lib", &key)), egui::Sense::click());
+                    if click.clicked() && !playing {
+                        play = Some((b, id.clone()));
+                    }
+                    if click.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    ui.add_space(3.0);
+                }
+                ui.add_space(12.0);
+            }
+            if ui.button("More firmwares…  (F1)").clicked() {
+                self.open_picker();
+            }
+        });
+        if let Some((b, id)) = play {
+            self.play_id(b, &id);
+        }
+    }
+
     fn open_picker(&mut self) {
         self.release_all();
         self.picker = true;
@@ -1005,56 +1229,6 @@ impl Desk {
     }
 }
 
-fn short(s: &str) -> String {
-    if s.chars().count() > 18 { format!("{}…", s.chars().take(17).collect::<String>()) } else { s.to_string() }
-}
-
-/// fm1-live's `piano`: A W S E D F T G Y H U J K O L P ; ' = C4..F5 (the FM-1's matrix ids).
-fn piano(k: Key) -> Option<u8> {
-    let semis = match k {
-        Key::A => 0,
-        Key::W => 1,
-        Key::S => 2,
-        Key::E => 3,
-        Key::D => 4,
-        Key::F => 5,
-        Key::T => 6,
-        Key::G => 7,
-        Key::Y => 8,
-        Key::H => 9,
-        Key::U => 10,
-        Key::J => 11,
-        Key::K => 12,
-        Key::O => 13,
-        Key::L => 14,
-        Key::P => 15,
-        Key::Semicolon => 16,
-        Key::Quote => 17,
-        _ => return None,
-    };
-    Some(21 + semis)
-}
-
-/// fm1-live's `button`: Z X OCTAVE, Space PLAY, R REC, 1..0 the button row.
-fn button(k: Key) -> Option<u8> {
-    Some(match k {
-        Key::Z => 0,
-        Key::X => 1,
-        Key::Space => 12,
-        Key::R => 13,
-        Key::Num1 => 2,
-        Key::Num2 => 3,
-        Key::Num3 => 4,
-        Key::Num4 => 5,
-        Key::Num5 => 6,
-        Key::Num6 => 7,
-        Key::Num7 => 8,
-        Key::Num8 => 9,
-        Key::Num9 => 10,
-        Key::Num0 => 11,
-        _ => return None,
-    })
-}
 
 fn base_fm1() -> &'static [u32] {
     static B: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
@@ -1070,7 +1244,10 @@ impl eframe::App for Desk {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_jobs();
         // F1 opens the picker, Esc closes it (back to what plays)
-        let (f1, esc) = ctx.input(|i| (i.key_pressed(Key::F1), i.key_pressed(Key::Escape)));
+        let (f1, esc, f2) = ctx.input(|i| (i.key_pressed(Key::F1), i.key_pressed(Key::Escape), i.key_pressed(Key::F2)));
+        if f2 && !self.picker {
+            self.toggle_library();
+        }
         if f1 && !self.picker {
             self.open_picker();
         } else if (esc || f1) && self.picker && self.running.is_some() {
@@ -1086,6 +1263,13 @@ impl eframe::App for Desk {
             self.title = title;
         }
 
+        if !self.picker && self.settings.library {
+            egui::SidePanel::left("library")
+                .exact_width(LIBRARY_W)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(Color32::from_rgb(22, 23, 26)).inner_margin(egui::Margin::symmetric(10, 8)))
+                .show(ctx, |ui| self.library_ui(ui));
+        }
         if !self.picker {
             egui::TopBottomPanel::bottom("status").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 28)).inner_margin(egui::Margin::symmetric(10, 6))).show(ctx, |ui| self.status_bar(ui));
         }
@@ -1106,6 +1290,9 @@ impl eframe::App for Desk {
             }
             if let Some(t) = &self.tex {
                 ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            if !self.picker && self.settings.hints && self.running.is_some() {
+                self.key_letters(ui.painter(), rect);
             }
             if self.picker {
                 // over the panel, dimmed, full window
@@ -1133,6 +1320,7 @@ impl eframe::App for Desk {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(r) = self.running.take() {
+            self.snapshot(&r);
             r.session.stop(&self.midi);
         }
         self.settings.save(&self.store);

@@ -170,6 +170,10 @@ impl Store {
     pub fn save_path(&self, b: BoardId, id: &str) -> PathBuf {
         self.root.join("saves").join(b.dir()).join(format!("{}.flash", safe(id)))
     }
+    /// The firmware's screen as it last looked (RGB565, 240 x 240): the Library's thumbnail.
+    pub fn snap_path(&self, b: BoardId, id: &str) -> PathBuf {
+        self.root.join("saves").join(b.dir()).join(format!("{}.lcd", safe(id)))
+    }
     fn cache_path(&self, b: BoardId) -> PathBuf {
         self.root.join("catalogs").join(format!("{}.json", b.dir()))
     }

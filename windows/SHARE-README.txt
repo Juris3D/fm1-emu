@@ -25,7 +25,7 @@ Next time, the app starts with the firmware you played last.
 
 Needs: Windows 10 or 11, 64-bit; an internet connection for the firmware downloads.
 A recent CPU plays every firmware in real time. If the sound crackles, lower the clock
-in the bar at the bottom (try 160 MHz, then 120).
+(Settings, bottom right: try 160 MHz, then 120).
 
 
 PLAYING
@@ -33,18 +33,26 @@ PLAYING
 
 While a synth plays, its panel fills the window. Mouse: click or drag across the keys
 (lower on a key = harder), click buttons and pads, drag or scroll the knobs, drag faders
-and wheels. Any MIDI keyboard plugged in plays it too (choose the input at the bottom).
+and wheels. Any MIDI keyboard plugged in plays it too.
 
-  Computer keys        FM-1                 SMK-37
-  A ... '              keys C4 .. F5        keys C4 .. F5
-  W E T Y U O P        the black keys       the black keys
-  Z / X                octave - / +         octave - / +
-  Space / R            PLAY / REC           SEQ PLAY / SEQ REC
-  1 ... 0 / 1 ... 8    buttons              the top row of pads
-  arrows, comma/dot    encoders             K1, K2, K3
+The computer keyboard plays it as well, in one of two layouts (Settings, bottom right;
+"Show the letters on the keys" prints them on the drawn keys):
 
-  F1                   the firmware list (over the panel)
-  Esc                  back to playing
+  Ableton (default)    A S D F G H J K L ; '  the white keys from C4
+                       W E T Y U O P          the black keys
+                       Z / X  octave,  Space PLAY,  R REC
+                       1 ... 0  the FM-1's buttons  /  1 ... 8  the SMK-37's top pads
+                       arrows, comma / dot    the first encoders
+
+  FL Studio / tracker  Z X C V B N M , . /    the white keys from C (S D G H J L ; black)
+                       Q W E R T Y U I O P    an octave up (2 3 5 6 7 9 0 black)
+                       - / =  octave,  Space PLAY,  Enter REC
+                       F3 ... F12  the FM-1's buttons  /  F3 ... F10  the SMK-37's pads
+                       arrows, Page Up / Down the first encoders
+
+  F1    the firmware list (over the panel)        Esc   back to playing
+  F2    the Library: both synths and your firmwares as pictures of their screens,
+        the last played first; one click switches
 
 What each button does is up to the firmware: its "source" link in the list leads to
 its page, which usually has a manual.
@@ -53,13 +61,16 @@ In the list: type to search; "updates available" appears when firmwares have new
 versions; "Open own .fwsc..." plays a package from your PC, e.g. M-VAVE's own firmware
 (FM-1.fwsc / SMK-37 Pro_016.fwsc, which M-VAVE's site has and this app cannot fetch).
 
+Settings also has the clock (lower it if the sound crackles) and the MIDI input.
+
 
 WHERE THINGS GO
 ---------------
 
 Next to the .exe:
   firmwares\   the downloaded firmware packages
-  saves\       what each firmware saved to its flash (patches, settings, songs)
+  saves\       what each firmware saved to its flash (patches, settings, songs),
+               and its screen as last seen (the Library's pictures)
   catalogs\    the firmware lists, as last fetched
   fm1-desk.json  the app's settings
 (If the folder is not writable, all of this goes to %LOCALAPPDATA%\FM-1 SMK-37 Desk.)
