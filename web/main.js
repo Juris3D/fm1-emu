@@ -596,27 +596,37 @@ midiChSel.addEventListener("change", () => {
 // clock against the wall clock (getOutputTimestamp: the output falls behind when quanta come
 // late, also with a load below 100% when the buffer is too small for this device's hiccups).
 // Some seconds of either, once the JIT has warmed up, bring up a warning that offers the fix.
+// The speed shown is the emulator's own: emulated time per time spent emulating (as
+// `node web/bench.mjs` and `fm1-live --bench` print it); at 1x a device just keeps up.
 const warnBox = document.getElementById("perfwarn");
 const perf = {
   reset() {
-    this.busy = 0; this.span = 0; this.worst = 0;
-    this.secs = 0; this.bad = 0; this.drops = 0; this.loads = []; this.drift = 0;
-    this.stamp = null; this.mips = 0; this.dismissed = false;
+    this.busy = 0; this.span = 0; this.emulated = 0; this.idle = 0; this.idleShare = 0; this.worst = 0;
+    this.secs = 0; this.bad = 0; this.drops = 0; this.loads = []; this.speeds = []; this.drift = 0;
+    this.stamp = null; this.jit = null; this.dismissed = false;
     warnBox.hidden = true;
   },
   add(m) {
     this.busy += m.busy;
     this.span += (m.quanta * m.frames) / 44.1;     // ms of audio those quanta stand for
+    this.emulated += m.emulated ?? 0;              // ms of emulated time they ran
+    this.idle += m.idle ?? 0;                      // of which idle skipping jumped over
     if (m.worst > this.worst) this.worst = m.worst;
+    this.jit = m.jit;
   },
   load() { return this.loads.length ? this.loads[this.loads.length - 1] : 0; },
   loadText() { return this.loads.length ? `${Math.round(100 * this.load())}%` : "…"; },
+  speed() { return this.speeds.length ? this.speeds[this.speeds.length - 1] : NaN; },
+  speedText() { return Number.isFinite(this.speed()) ? `${this.speed().toFixed(this.speed() < 10 ? 1 : 0)}x real time` : "…"; },
   // once a second: close the window, judge it
-  second(mips, m) {
-    this.mips = mips;
+  second(m) {
     if (this.span > 0) this.loads.push(this.busy / this.span);
+    // (a whole-millisecond worklet clock: a second's quanta still add up to a fair figure)
+    if (this.busy > 0 && this.emulated > 0) this.speeds.push(this.emulated / this.busy);
+    if (this.emulated > 0) this.idleShare = Math.min(1, this.idle / this.emulated);
     if (this.loads.length > 30) this.loads.shift();
-    this.busy = 0; this.span = 0;
+    if (this.speeds.length > 30) this.speeds.shift();
+    this.busy = 0; this.span = 0; this.emulated = 0; this.idle = 0;
     const ts = ac.getOutputTimestamp?.();
     let drift = 0;
     if (ts && ts.contextTime > 0) {
@@ -633,21 +643,41 @@ const perf = {
     this.bad = over || late ? this.bad + 1 : 0;
     if (this.bad >= 3 && warnBox.hidden && !this.dismissed) this.warn(over);
   },
+  // A lower clock that brings the load down to ~80%, if one does. The cost of emulating a
+  // second is a fixed part (about a quarter at the clocks offered: the peripherals, the audio, the
+  // JIT's dispatch) and the cycles the firmware runs, which a lower clock cuts only where the
+  // firmware runs more of them than the lower clock has: the time it idles is skipped (fm1_soc's
+  // skip_idle), so a firmware that mostly idles (M-VAVE's: 70-80% of the time at 120-240 MHz)
+  // does the same work at any clock, and a lower one does not help it (measured: 2.6x real time
+  // at 60 MHz, 2.4x at 240; Felucca 5.0x at 60 MHz, 2.0x at 240).
+  lowerClock(load) {
+    const FIXED = 0.25, busy = mhz * (1 - this.idleShare);   // MHz of cycles the firmware runs
+    const at = (c) => load * (FIXED + (1 - FIXED) * Math.min(busy, c) / Math.max(busy, 1));
+    const lower = CLOCKS.filter((c) => c < mhz && at(c) <= 0.8);
+    const pick = lower.length ? lower[lower.length - 1] : CLOCKS.find((c) => c < mhz);
+    return pick && at(pick) < 0.85 * load ? pick : null;     // only where it clearly helps
+  },
   warn(over) {
     const load = this.load();
-    const lower = CLOCKS.filter((c) => c < mhz && c <= mhz * 0.8 / Math.max(load, 0.01));
-    const pick = lower.length ? lower[lower.length - 1] : CLOCKS.find((c) => c < mhz);
+    const pick = over ? this.lowerClock(load) : null;
     const text = document.getElementById("perfwarn-text");
     const fix = document.getElementById("perfwarn-fix");
+    // (a debugger attached, as DevTools open, runs the WebAssembly 3-4x slower)
+    const devtools = " If the browser's developer tools are open, close them: they slow the emulator down 3-4x.";
     fix.hidden = false;
     if (over && pick) {
       text.textContent = `This device can't run ${fw.name} at ${mhz} MHz in real time (it needs ${Math.round(100 * load)}% ` +
-        `of the audio thread), so the sound breaks up. Most firmwares play fine at a lower clock.`;
+        `of the audio thread), so the sound breaks up. It needs less at a lower clock.` + devtools;
       fix.textContent = `Use ${pick} MHz`;
       fix.onclick = () => { setClock(pick); };
     } else if (over) {
-      text.textContent = `Even at ${mhz} MHz this device can't run ${fw.name} in real time (it needs ` +
-        `${Math.round(100 * load)}% of the audio thread), so the sound breaks up. A faster device or the desktop version will play it.`;
+      // (a lower clock exists but would not help: say why)
+      const why = !CLOCKS.some((c) => c < mhz) ? "" : this.idleShare >= 0.3
+        ? " A lower clock would not help: the emulator skips the time this firmware idles, so it costs about the same at any clock."
+        : " A lower clock would help only a little.";
+      text.textContent = `This device can't run ${fw.name} at ${mhz} MHz in real time (it needs ` +
+        `${Math.round(100 * load)}% of the audio thread), so the sound breaks up.` + why + devtools +
+        ` A faster device or the desktop version will play it.`;
       fix.hidden = true;
     } else if (latency !== "playback") {
       text.textContent = `The sound drops out although the emulator has time to spare (load ${Math.round(100 * load)}%): ` +
@@ -663,7 +693,7 @@ const perf = {
   // for a bug report: what the device is and how it kept up
   report() {
     const r = (v, d = 0) => (Number.isFinite(v) ? v.toFixed(d) : "?");
-    const loads = this.loads.map((l) => Math.round(100 * l));
+    const loads = this.loads.map((l) => Math.round(100 * l)), jit = this.jit;
     return [
       `FM-1 emulator report (${location.origin}${location.pathname})`,
       `firmware: ${fw.id} ${fw.version || ""} · clock ${mhz} MHz · JIT ${params.get("jit") === "0" ? "off" : "on"}`,
@@ -671,9 +701,12 @@ const perf = {
       `cores: ${navigator.hardwareConcurrency ?? "?"} · memory: ${navigator.deviceMemory ?? "?"} GB`,
       `audio: ${ac ? `${ac.sampleRate} Hz, buffer "${latency}", base latency ${r(1000 * (ac.baseLatency ?? NaN), 1)} ms, ` +
         `output latency ${r(1000 * (ac.outputLatency ?? NaN), 1)} ms` : "not started"}`,
-      `load (last ${loads.length} s): ${loads.join(" ")}% · worst quantum since boot ${r(this.worst, 1)} ms of ${r(128 / 44.1, 1)}`,
-      `audio clock drift: ${r(100 * this.drift, 1)}% · seconds with drops: ${this.drops} · ${r(this.mips)} M instructions/s`,
-      `short audio quanta: ${frame?.short ?? "?"}`,
+      `speed (emulated time per time spent emulating, last ${this.speeds.length} s): ${this.speeds.map((v) => r(v, 2)).join(" ")}x real time`,
+      `load (last ${loads.length} s): ${loads.join(" ")}% · worst quantum since the audio started ${r(this.worst, 1)} ms of ${r(128 / 44.1, 1)}`,
+      `audio clock drift: ${r(100 * this.drift, 1)}% · seconds with drops: ${this.drops} · idle skipped: ${r(100 * this.idleShare)}% of the time`,
+      `jit: ${jit ? `${jit.regions} regions compiled, ${jit.failed} failed${jit.error ? ` (${jit.error})` : ""} · ` +
+        `compiling took ${r(jit.compileMs)} ms, the longest ${r(jit.compileMaxMs, 1)} ms` : "?"}`,
+      `emulated: ${frame ? r(frame.ms / 1000, 1) : "?"} s · short audio quanta: ${frame?.short ?? "?"}`,
     ].join("\n");
   },
 };
@@ -824,7 +857,9 @@ function boot(options = {}) {
       });
       node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
         sectors: packSectors(sectors).buffer, syx: importedBank ? importedBank.slice().buffer : null,
-        mhz: clock, jit: params.get("jit") !== "0" });
+        mhz: clock, jit: params.get("jit") !== "0",
+        // (?ahead=0: each quantum emulates only for its own frames, as before the even pace)
+        ahead: params.has("ahead") ? Number(params.get("ahead")) : undefined });
       status.textContent = `booting ${f.name}…`;
       await ready;
       if (bank === importedBank) bank = null; // imports seed flash once; saved edits win on later boots
@@ -912,16 +947,17 @@ function onWorklet(e) {
   perf.add(m);
   const now = performance.now();
   if (!last || now - last.t > 1000) {
-    const mips = last ? (m.minsns - last.minsns) / ((now - last.t) / 1000) : 0;
-    perf.second(mips, m);
+    perf.second(m);
     status.textContent = m.halted ? `${fw.name}: the emulated CPU halted` :
-      `${fw.name} · ${mhz} MHz · ${mips.toFixed(0)} M instructions/s · load ${perf.loadText()} · ` +
+      `${fw.name} · ${mhz} MHz · ${perf.speedText()} · load ${perf.loadText()} · ` +
       `${(m.ms / 1000).toFixed(1)} s`;
-    // (hover: the JIT's work in the audio thread, and the audio's health)
-    status.title = [m.jit ? `JIT: ${m.jit.regions} regions compiled, ${m.jit.failed} failed${m.jit.error ? ` (${m.jit.error})` : ""}` : "",
+    // (hover: what the figures mean, the JIT's work in the audio thread, and the audio's health)
+    status.title = [`speed: how much faster than real time the emulator runs this firmware on this device ` +
+      `(emulated time per time spent emulating; below 1x the sound breaks up)`,
       `load: the share of the audio thread's time the emulator takes (over 100%: the sound breaks up)`,
+      m.jit ? `JIT: ${m.jit.regions} regions compiled, ${m.jit.failed} failed${m.jit.error ? ` (${m.jit.error})` : ""}` : "",
       `${m.short} short audio quanta (the firmware's audio fell behind its own clock)`].filter(Boolean).join("\n");
-    last = { t: now, minsns: m.minsns };
+    last = { t: now };
   }
 }
 

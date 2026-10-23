@@ -159,6 +159,7 @@ impl Asm {
     pub fn alu_ri64(&mut self, op: Alu, d: Reg, imm: i8) { self.rr(None, true, &[0x83], op as u8, d, false); self.b(imm as u8); }
     /// cmp r32, [mem]
     pub fn cmp_rm(&mut self, r: Reg, mem: Mem) { self.rm(None, false, &[0x3b], r, mem, false); }
+    pub fn cmp_rm64(&mut self, r: Reg, mem: Mem) { self.rm(None, true, &[0x3b], r, mem, false); }
     /// cmp dword [mem], imm8
     pub fn cmp_m_i8(&mut self, mem: Mem, imm: i8) { self.rm(None, false, &[0x83], 7, mem, false); self.b(imm as u8); }
     /// cmp byte [mem], imm8
@@ -234,14 +235,11 @@ mod tests {
             ("cmp byte ptr [r15 + rdx], 0", Box::new(|a| a.cmp_m8_i8(mx(R15, RDX), 0)), &[0x41, 0x80, 0x3c, 0x17, 0x00]),
             ("cmp dword ptr [rbp + 0x18], 0", Box::new(|a| a.cmp_m_i8(m(RBP, 0x18), 0)), &[0x83, 0x7d, 0x18, 0x00]),
             ("cmp r11d, dword ptr [rsp]", Box::new(|a| a.cmp_rm(R11, m(RSP, 0))), &[0x44, 0x3b, 0x1c, 0x24]),
-            // (the indirect-jump cache's lookup, the if-else skip and the interrupt enable)
+            ("cmp r11, qword ptr [rsi]", Box::new(|a| a.cmp_rm64(R11, m(RSI, 0))), &[0x4c, 0x3b, 0x1e]),
             ("cmp eax, dword ptr [r10 + rcx]", Box::new(|a| a.cmp_rm(RAX, mx(R10, RCX))), &[0x41, 0x3b, 0x04, 0x0a]),
             ("mov r11, qword ptr [r10 + rcx + 8]", Box::new(|a| a.ld64(R11, Mem { base: R10, index: Some((RCX, 1)), disp: 8 })), &[0x4d, 0x8b, 0x5c, 0x0a, 0x08]),
-            ("and ecx, 0x1ffe", Box::new(|a| a.alu_ri(Alu::And, RCX, 0x1ffe)), &[0x81, 0xe1, 0xfe, 0x1f, 0x00, 0x00]),
-            ("shl ecx, 3", Box::new(|a| a.sh_i(Sh::Shl, RCX, 3)), &[0xc1, 0xe1, 0x03]),
-            ("jmp r11", Box::new(|a| a.jmp_r(R11)), &[0x41, 0xff, 0xe3]),
-            ("mov byte ptr [rbx + 0x60], al", Box::new(|a| a.st8(m(RBX, 0x60), RAX)), &[0x88, 0x43, 0x60]),
-            ("mov dword ptr [rbp + 0x28], 0x2000010", Box::new(|a| a.st_imm(m(RBP, 0x28), 0x0200_0010)), &[0xc7, 0x45, 0x28, 0x10, 0x00, 0x00, 0x02]),
+            ("and ecx, 0x3fff", Box::new(|a| a.alu_ri(Alu::And, RCX, 0x3fff)), &[0x81, 0xe1, 0xff, 0x3f, 0, 0]),
+            ("shl ecx, 4", Box::new(|a| a.sh_i(Sh::Shl, RCX, 4)), &[0xc1, 0xe1, 0x04]),
             ("movzx eax, al", Box::new(|a| a.movzx8(RAX, RAX)), &[0x0f, 0xb6, 0xc0]),
             ("movsx eax, al", Box::new(|a| a.movsx8(RAX, RAX)), &[0x0f, 0xbe, 0xc0]),
             ("movzx eax, ax", Box::new(|a| a.movzx16(RAX, RAX)), &[0x0f, 0xb7, 0xc0]),

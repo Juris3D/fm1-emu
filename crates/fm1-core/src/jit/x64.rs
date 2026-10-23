@@ -14,7 +14,7 @@
 //! host (the interpreter); conversions to integers saturate as Rust's `as` does (cvttss2si alone
 //! gives 0x8000_0000 for NaN and out of range); min / max through the interpreter's executor.
 
-use super::{h_icfg, h_irq_window, h_op, h_ram_ok, h_read, h_write, off_hold, off_icfg_store, off_ie, off_pc, off_reg, off_rets, off_sp, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_PRED, OFF_SLOT};
+use super::{h_pair, h_ram_ok, h_read, h_write, insns, off_hold, off_pc, off_reg, off_rets, off_sp, off_stop_io, off_stop_pc, off_stop_rest, op_helper, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_PRED, OFF_SLOT, OFF_VER};
 use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Mem, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
 use crate::{Base, Bus, Cond, Fast, Op, RmwOp};
 
@@ -36,11 +36,11 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
-    h_op: u64,
-    /// the indirect-jump cache (`jit::ITab`)
+    h_pair: u64,
+    /// `Jit::itab`'s address
     itab: u64,
-    /// inside an if-else block's then-part: (then end, else end), the skip taken at its end
-    pred: Option<(u32, u32)>,
+    /// the runner's stop checks are compiled (`Jit::stops`)
+    stops: bool,
 }
 
 fn icond(c: Cond) -> Cc {
@@ -129,24 +129,32 @@ impl Gen<'_> {
         self.a.st_imm(m(CPU, off_pc() as i32), pc);
         self.leave(count);
     }
-    /// Continue at pc = eax, known only now (a return, a table branch): straight into its
-    /// compiled body when the indirect-jump cache has it (the body checks the limit itself, as a
-    /// chained one does), else back to Rust, which puts it there once it is compiled.
-    fn exit_reg(&mut self, reg: Reg, count: u32) {
-        debug_assert!(reg == RAX);
-        let miss = self.a.label();
-        self.a.st(m(CPU, off_pc() as i32), RAX);
+    /// Continue at pc = eax, a computed target: straight into its compiled body when the table
+    /// holds one for that pc, else back to Rust.
+    fn ind(&mut self, count: u32) {
+        self.ind_brk(count, false);
+    }
+    /// `ind` after an instruction that may have used the bus (`brk`): first leave if the next
+    /// tick is due (or a code word was written), as `check_brk` does.
+    fn ind_brk(&mut self, count: u32, brk: bool) {
+        let back = self.a.label();
         self.add_imm(DONE, count);
-        // ecx = the entry's offset: ((pc >> 1) & mask) * 16
+        if brk {
+            self.a.cmp_m_i8(m(CTX, OFF_BRK as i32), 0);
+            self.a.jcc(Cc::Ne, back);
+        }
+        // the entry's byte offset: ((pc >> 1) & mask) * 16
         self.a.mov_rr(RCX, RAX);
-        self.a.alu_ri(Alu::And, RCX, ((1u32 << ITAB_BITS) - 1) << 1);
-        self.a.sh_i(Sh::Shl, RCX, 3);
+        self.a.sh_i(Sh::Shr, RCX, 1);
+        self.a.alu_ri(Alu::And, RCX, (1 << ITAB_BITS) - 1);
+        self.a.sh_i(Sh::Shl, RCX, 4);
         self.a.mov_ri64(R10, self.itab);
         self.a.cmp_rm(RAX, mx(R10, RCX));
-        self.a.jcc(Cc::Ne, miss);
+        self.a.jcc(Cc::Ne, back);
         self.a.ld64(R11, Mem { base: R10, index: Some((RCX, 1)), disp: 8 });
         self.a.jmp_r(R11);
-        self.a.bind(miss);
+        self.a.bind(back);
+        self.a.st(m(CPU, off_pc() as i32), RAX);
         self.a.mov_rr(RAX, DONE);
         self.a.jmp(self.exit);
     }
@@ -324,31 +332,576 @@ impl Gen<'_> {
         self.a.bind(done);
     }
 
-    /// After an instruction that may have called the bus: leave if the next tick is due.
-    fn check_brk(&mut self, next_pc: u32, count: u32, hold: bool) {
+    /// After an instruction that may have called the bus: leave if the next tick is due (or
+    /// code was written), `rest` instructions before the block's end (`Cpu::stop_rest`).
+    fn check_brk(&mut self, next_pc: u32, count: u32, hold: bool, rest: u32) {
         let go = self.a.label();
         self.a.cmp_m_i8(m(CTX, OFF_BRK as i32), 0);
         self.a.jcc(Cc::E, go);
         if hold {
             self.a.st_imm(m(CPU, off_hold() as i32), 1);
         }
-        match self.pred {
-            // inside an if-else block's then-part: at its end the skip is taken (as `finish`),
-            // before it the skip goes with the exit (`run` puts it in pred_skips)
-            Some((te, ee)) if next_pc == te => self.exit_imm(ee, count),
-            Some((te, ee)) => {
-                self.a.st_imm(m(CTX, OFF_PRED as i32), te);
-                self.a.st_imm(m(CTX, OFF_PRED as i32 + 4), ee);
-                self.exit_imm(next_pc, count);
-            }
-            None => self.exit_imm(next_pc, count),
+        if self.stops && rest > 0 {
+            self.a.st_imm(m(CPU, off_stop_rest() as i32), rest);
         }
+        self.exit_imm(next_pc, count);
+        self.a.bind(go);
+    }
+    /// Inside an if-else block's then-part, after an op that may have used the bus: leave if
+    /// the next tick is due, with the skip (te, ee) for `Cpu::pred_skips` (`Ctx::pred`).
+    fn check_brk_pred(&mut self, next_pc: u32, count: u32, te: u32, ee: u32) {
+        let go = self.a.label();
+        self.a.cmp_m_i8(m(CTX, OFF_BRK as i32), 0);
+        self.a.jcc(Cc::E, go);
+        self.a.st_imm(m(CTX, OFF_PRED as i32), te);
+        self.a.st_imm(m(CTX, OFF_PRED as i32 + 4), ee);
+        self.exit_imm(next_pc, count);
+        self.a.bind(go);
+    }
+    /// Jump to `taken` when a predicated block's condition holds (`exec_fast`'s IfBlk).
+    fn if_jump(&mut self, a: u8, rk: u8, fam: u8, alt: bool, rv: u32, taken: Label) {
+        self.rhs(rk, rv);
+        self.ld_reg(RAX, a);
+        if fam == 2 {
+            self.a.test_rr(RAX, RCX);
+            self.a.jcc(if alt { Cc::Ne } else { Cc::E }, taken);
+        } else {
+            self.branch(crate::cond_of_fam(fam as u64, alt), taken);
+        }
+    }
+    /// After a swapped pair (or an if-else block's then-part): leave if the next tick is due
+    /// (or a code word was written), or an interrupt is pending (then `run_fast` stops:
+    /// `Ctx::stop`). Nothing to call while neither brk is set nor `Ctx::irq` (none pending,
+    /// known since the last helper).
+    /// (`rest`: instructions left in the block, as `check_brk`)
+    fn check_pair(&mut self, next_pc: u32, count: u32, rest: u32) {
+        let go = self.a.label();
+        self.a.ld64(R11, m(CTX, OFF_BRK as i32)); // brk | irq << 32
+        self.a.test_rr64(R11, R11);
+        self.a.jcc(Cc::E, go);
+        self.a.mov_rr64(RDI, CTX);
+        self.call(self.h_pair);
+        self.a.test_rr(RAX, RAX);
+        self.a.jcc(Cc::E, go);
+        if self.stops && rest > 0 {
+            self.a.st_imm(m(CPU, off_stop_rest() as i32), rest);
+        }
+        self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
 }
 
+/// Native code for one plain micro-op, instruction `idx` of its block (the helpers' tick index),
+/// `next_pc` after it; true: it may have used the bus.
+fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: bool) -> bool {
+    let count = idx + 1;
+    let mut bus_used = false;
+    match fast {
+        Fast::Nop => {}
+        Fast::MovI { d, v } => {
+            g.a.st_imm(m(CPU, off_reg(d) as i32), v);
+        }
+        Fast::Mov { d, s } => {
+            g.ld_reg(RAX, s);
+            g.st_reg(RAX, d);
+        }
+        Fast::AddRI { d, s, v } => {
+            g.ld_reg(RAX, s);
+            g.add_imm(RAX, v);
+            g.st_reg(RAX, d);
+        }
+        Fast::ShlI { d, s, n } => {
+            g.ld_reg(RAX, s);
+            if n & 31 != 0 {
+                g.a.sh_i(Sh::Shl, RAX, n & 31);
+            }
+            g.st_reg(RAX, d);
+        }
+        Fast::SarI { d, s, n } => {
+            g.ld_reg(RAX, s);
+            if n & 31 != 0 {
+                g.a.sh_i(Sh::Sar, RAX, n & 31);
+            }
+            g.st_reg(RAX, d);
+        }
+        Fast::Alu3 { d, a, b, op } => {
+            g.ld_reg(RAX, a);
+            g.ld_reg(RCX, b);
+            g.alu(op);
+            g.st_reg(RAX, d);
+        }
+        Fast::Alu3I { d, a, v, op } => {
+            g.ld_reg(RAX, a);
+            g.a.mov_ri(RCX, v);
+            g.alu(op);
+            g.st_reg(RAX, d);
+        }
+        Fast::Alu2 { d, b, op } => {
+            g.ld_reg(RAX, d);
+            g.ld_reg(RCX, b);
+            g.alu(op);
+            g.st_reg(RAX, d);
+        }
+        Fast::Alu2I { d, v, op } => {
+            g.ld_reg(RAX, d);
+            g.a.mov_ri(RCX, v);
+            g.alu(op);
+            g.st_reg(RAX, d);
+        }
+        Fast::A4 { d, s, op, rk, rv } => {
+            g.rhs(rk, rv);
+            g.ld_reg(RAX, s);
+            g.alu(op);
+            g.st_reg(RAX, d);
+        }
+        Fast::Ext { d, s, part, signed } => {
+            g.ld_reg(RAX, s);
+            match (part, signed) {
+                (0, false) => g.a.movzx8(RAX, RAX),
+                (0, true) => g.a.movsx8(RAX, RAX),
+                (1, false) => g.a.movzx16(RAX, RAX),
+                (1, true) => g.a.movsx16(RAX, RAX),
+                (_, false) => g.a.sh_i(Sh::Shr, RAX, 16),
+                (_, true) => g.a.sh_i(Sh::Sar, RAX, 16),
+            }
+            g.st_reg(RAX, d);
+        }
+        Fast::MinMax { d, a, b, kind } => {
+            g.ld_reg(RAX, a);
+            g.ld_reg(RCX, b);
+            g.a.alu_rr(Alu::Cmp, RAX, RCX);
+            // b where a is not the one kept
+            let c = match kind { 0 => Cc::Ge, 1 => Cc::Le, 2 => Cc::Ae, _ => Cc::Be };
+            g.a.cmov(c, RAX, RCX);
+            g.st_reg(RAX, d);
+        }
+        // ---- branches (always a block's last op)
+        Fast::BrI { a, v, cond, target } => {
+            let t = g.a.label();
+            g.ld_reg(RAX, a);
+            g.a.mov_ri(RCX, v);
+            g.branch(cond, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::BrIEq { a, v, target } | Fast::BrINe { a, v, target } => {
+            let t = g.a.label();
+            g.ld_reg(RAX, a);
+            g.a.mov_ri(RCX, v);
+            g.branch(if matches!(fast, Fast::BrIEq { .. }) { Cond::Eq } else { Cond::Ne }, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::BrR { a, b, cond, target } => {
+            let t = g.a.label();
+            g.ld_reg(RAX, a);
+            g.ld_reg(RCX, b);
+            g.branch(cond, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::BitBr { r, mk, ne, mv, target } => {
+            let t = g.a.label();
+            g.rhs(mk, mv);
+            g.ld_reg(RAX, r);
+            g.a.test_rr(RAX, RCX);
+            g.a.jcc(if ne { Cc::Ne } else { Cc::E }, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::DecBr { r, cond, v, target } => {
+            let t = g.a.label();
+            g.ld_reg(RAX, r);
+            g.a.alu_ri(Alu::Sub, RAX, 1);
+            g.st_reg(RAX, r);
+            g.a.mov_ri(RCX, v);
+            g.branch(cond, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::Goto { target } => g.chain(target, count),
+        Fast::Call { target } => {
+            g.a.st_imm(m(CPU, off_rets() as i32), next_pc);
+            g.chain(target, count);
+        }
+        Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
+            // without an else part a predicated block is a conditional jump over its then part
+            let taken = g.a.label();
+            g.if_jump(a, rk, fam, alt, rv, taken);
+            g.chain(next_pc.wrapping_add(then_d as u32), count);
+            g.a.bind(taken);
+            g.chain(next_pc, count);
+        }
+        // (the multiply-accumulates 7 / 8 read d too, min / max are Rust's: through the
+        // interpreter's executor)
+        Fast::FOp { d, a, b, op } if !matches!(op, 5..=8) => {
+            g.ld_reg(RAX, a);
+            match op {
+                0..=3 => {
+                    g.ld_reg(RCX, b);
+                    g.a.movd_xr(0, RAX);
+                    g.a.movd_xr(1, RCX);
+                    let f = match op { 0 => Fop::Add, 1 => Fop::Sub, 2 => Fop::Mul, _ => Fop::Div };
+                    g.a.fop(f, 0, 1);
+                    g.a.movd_rx(RAX, 0);
+                }
+                0x1f => g.f2i(true),
+                0x5f => g.f2i(false),
+                0x8f => {
+                    g.a.cvtsi2ss(0, RAX, false);
+                    g.a.movd_rx(RAX, 0);
+                }
+                _ => {
+                    // u32 -> f32: the zero-extended rax as a signed 64-bit integer
+                    g.a.cvtsi2ss(0, RAX, true);
+                    g.a.movd_rx(RAX, 0);
+                }
+            }
+            g.st_reg(RAX, d);
+        }
+        Fast::Rts => {
+            g.a.ld(RAX, m(CPU, off_rets() as i32));
+            g.ind(count);
+        }
+        Fast::CallR { r } => {
+            g.a.st_imm(m(CPU, off_rets() as i32), next_pc);
+            g.ld_reg(RAX, r);
+            g.ind(count);
+        }
+        Fast::GotoR { r } => {
+            g.ld_reg(RAX, r);
+            g.ind(count);
+        }
+        // ---- memory
+        Fast::Ld { d, b, off, w, signed } => {
+            match b {
+                Base::Reg(r) => g.ld_reg(RAX, r),
+                Base::Sp => g.ld_sp(RAX),
+            }
+            g.add_imm(RAX, off);
+            g.load(w, signed, idx);
+            g.st_reg(RAX, d);
+            bus_used = true;
+        }
+        Fast::LdW { d, b, off } => {
+            g.ld_reg(RAX, b);
+            g.add_imm(RAX, off);
+            g.load(4, false, idx);
+            g.st_reg(RAX, d);
+            bus_used = true;
+        }
+        Fast::LdWSp { d, off } => {
+            g.ld_sp(RAX);
+            g.add_imm(RAX, off);
+            g.load(4, false, idx);
+            g.st_reg(RAX, d);
+            bus_used = true;
+        }
+        Fast::LdBu { d, b, off } => {
+            g.ld_reg(RAX, b);
+            g.add_imm(RAX, off);
+            g.load(1, false, idx);
+            g.st_reg(RAX, d);
+            bus_used = true;
+        }
+        Fast::St { s, b, off, w } => {
+            match b {
+                Base::Reg(r) => g.ld_reg(RAX, r),
+                Base::Sp => g.ld_sp(RAX),
+            }
+            g.add_imm(RAX, off);
+            g.ld_reg(RCX, s);
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::StW { s, b, off } => {
+            g.ld_reg(RAX, b);
+            g.add_imm(RAX, off);
+            g.ld_reg(RCX, s);
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::StWSp { s, off } => {
+            g.ld_sp(RAX);
+            g.add_imm(RAX, off);
+            g.ld_reg(RCX, s);
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::LdIdx { d, b, i, sh, w, signed } => {
+            g.ld_reg(RAX, b);
+            g.ld_reg(RCX, i);
+            if sh & 31 != 0 {
+                g.a.sh_i(Sh::Shl, RCX, sh & 31);
+            }
+            g.a.alu_rr(Alu::Add, RAX, RCX);
+            g.load(w, signed, idx);
+            g.st_reg(RAX, d);
+            bus_used = true;
+        }
+        Fast::StIdx { s, b, i, sh, w } => {
+            g.ld_reg(RAX, b);
+            g.ld_reg(RCX, i);
+            if sh & 31 != 0 {
+                g.a.sh_i(Sh::Shl, RCX, sh & 31);
+            }
+            g.a.alu_rr(Alu::Add, RAX, RCX);
+            g.ld_reg(RCX, s);
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::LdPost { d, b, w, signed, inc } => {
+            g.ld_reg(RAX, b);
+            g.load(w, signed, idx);
+            g.st_reg(RAX, d);
+            g.ld_reg(RAX, b); // (after the load wrote d, as the interpreter)
+            g.add_imm(RAX, inc);
+            g.st_reg(RAX, b);
+            bus_used = true;
+        }
+        Fast::StPost { s, b, w, inc } => {
+            g.ld_reg(RAX, b);
+            g.ld_reg(RCX, s);
+            g.store(w, idx);
+            g.ld_reg(RAX, b);
+            g.add_imm(RAX, inc);
+            g.st_reg(RAX, b);
+            bus_used = true;
+        }
+        // (i 16: the immediate increment; else register i's)
+        Fast::LdPre { d, b, i, w, signed, inc } => {
+            g.ld_reg(RAX, b);
+            if i < 16 {
+                g.ld_reg(RCX, i);
+                g.a.alu_rr(Alu::Add, RAX, RCX);
+            } else {
+                g.add_imm(RAX, inc);
+            }
+            g.st_reg(RAX, b);
+            g.load(w, signed, idx);
+            g.st_reg(RAX, d);
+            bus_used = true;
+        }
+        Fast::StPre { s, b, i, w, inc } => {
+            g.ld_reg(RAX, b);
+            if i < 16 {
+                g.ld_reg(RCX, i);
+                g.a.alu_rr(Alu::Add, RAX, RCX);
+            } else {
+                g.add_imm(RAX, inc);
+            }
+            g.st_reg(RAX, b);
+            g.ld_reg(RCX, s);
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::LdPostR { d, b, i, w, signed } => {
+            // (the increment as it was before the load wrote d, kept across a helper call)
+            g.ld_reg(RCX, i);
+            g.a.st(m(RSP, KEEP), RCX);
+            g.ld_reg(RAX, b);
+            g.load(w, signed, idx);
+            g.st_reg(RAX, d);
+            g.ld_reg(RAX, b);
+            g.a.ld(RCX, m(RSP, KEEP));
+            g.a.alu_rr(Alu::Add, RAX, RCX);
+            g.st_reg(RAX, b);
+            bus_used = true;
+        }
+        Fast::StPostR { s, b, i, w } => {
+            g.ld_reg(RAX, b);
+            g.ld_reg(RCX, s);
+            g.store(w, idx);
+            g.ld_reg(RAX, b);
+            g.ld_reg(RCX, i);
+            g.a.alu_rr(Alu::Add, RAX, RCX);
+            g.st_reg(RAX, b);
+            bus_used = true;
+        }
+        Fast::Rmw { b, w, op: rop, off, v } => {
+            g.ld_reg(RAX, b);
+            g.add_imm(RAX, off);
+            g.a.st(m(RSP, KEEP), RAX);
+            if let RmwOp::Mov = rop {
+                g.a.mov_ri(RCX, v);
+            } else {
+                g.load(w, false, idx);
+                g.a.mov_rr(RCX, RAX);
+                let o = match rop {
+                    RmwOp::Or => Alu::Or,
+                    RmwOp::And => Alu::And,
+                    RmwOp::Xor => Alu::Xor,
+                    RmwOp::Add => Alu::Add,
+                    RmwOp::Sub => Alu::Sub,
+                    RmwOp::Mov => unreachable!(),
+                };
+                g.a.alu_ri(o, RCX, v);
+            }
+            g.a.ld(RAX, m(RSP, KEEP));
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::MemA4 { b, off, op: aop, rk, rv } => {
+            g.rhs(rk, rv);
+            g.a.st(m(RSP, KEEP2), RCX);
+            g.ld_reg(RAX, b);
+            g.add_imm(RAX, off as u32);
+            g.a.st(m(RSP, KEEP), RAX);
+            g.load(4, false, idx);
+            g.a.ld(RCX, m(RSP, KEEP2));
+            g.alu(aop);
+            g.a.mov_rr(RCX, RAX);
+            g.a.ld(RAX, m(RSP, KEEP));
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::SpAdd { v } => {
+            g.ld_sp(RAX);
+            g.add_imm(RAX, v);
+            g.st_sp(RAX);
+        }
+        Fast::RFromSp { d, v } => {
+            g.ld_sp(RAX);
+            g.add_imm(RAX, v);
+            g.st_reg(RAX, d);
+        }
+        Fast::Mov2 { dh, dl, sh, sl } => {
+            g.ld_reg(RAX, sh);
+            g.ld_reg(RCX, sl);
+            g.st_reg(RAX, dh);
+            g.st_reg(RCX, dl);
+        }
+        Fast::Mov2I { dh, dl, v } => {
+            g.a.st_imm(m(CPU, off_reg(dl) as i32), v);
+            g.a.st_imm(m(CPU, off_reg(dh) as i32), ((v as i32) >> 31) as u32);
+        }
+        Fast::BitExt { d, s, p, l, signed } => {
+            let (p, l) = (p & 31, l & 31);
+            g.ld_reg(RAX, s);
+            if p != 0 {
+                g.a.sh_i(Sh::Shr, RAX, p);
+            }
+            if l != 0 {
+                if signed {
+                    g.a.sh_i(Sh::Shl, RAX, 32 - l);
+                    g.a.sh_i(Sh::Sar, RAX, 32 - l);
+                } else {
+                    g.a.alu_ri(Alu::And, RAX, (1u32 << l) - 1);
+                }
+            }
+            g.st_reg(RAX, d);
+        }
+        Fast::BitIns { d, s, p, l } => {
+            let (p, l) = (p as u32 & 31, l as u32 & 31);
+            let mask = if l == 0 { u32::MAX } else { (1u32 << l) - 1 };
+            g.ld_reg(RAX, s);
+            g.ld_reg(RCX, d);
+            g.a.alu_ri(Alu::And, RAX, mask);
+            if p != 0 {
+                g.a.sh_i(Sh::Shl, RAX, p as u8);
+            }
+            g.a.alu_ri(Alu::And, RCX, !(mask << p));
+            g.a.alu_rr(Alu::Or, RAX, RCX);
+            g.st_reg(RAX, d);
+        }
+        Fast::PushRets { n } => {
+            let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
+            for r in std::iter::once(-1).chain((bot..=top).rev()) {
+                g.ld_sp(RAX);
+                g.a.alu_ri(Alu::Sub, RAX, 4);
+                g.st_sp(RAX);
+                if r < 0 {
+                    g.a.ld(RCX, m(CPU, off_rets() as i32));
+                } else {
+                    g.ld_reg(RCX, r as u8);
+                }
+                g.store(4, idx);
+            }
+            bus_used = true;
+        }
+        Fast::PopPc { n } => {
+            let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
+            for r in bot..=top {
+                g.ld_sp(RAX);
+                g.load(4, false, idx);
+                g.st_reg(RAX, r as u8);
+                g.ld_sp(RAX);
+                g.a.alu_ri(Alu::Add, RAX, 4);
+                g.st_sp(RAX);
+            }
+            g.ld_sp(RAX);
+            g.load(4, false, idx);
+            g.ld_sp(RDX);
+            g.a.alu_ri(Alu::Add, RDX, 4);
+            g.st_sp(RDX);
+            g.ind_brk(count, true);
+        }
+        Fast::PopRets => {
+            g.ld_sp(RAX);
+            g.load(4, false, idx);
+            g.a.st(m(CPU, off_rets() as i32), RAX);
+            g.ld_sp(RAX);
+            g.a.alu_ri(Alu::Add, RAX, 4);
+            g.st_sp(RAX);
+            bus_used = true;
+        }
+        Fast::Tb { r, half } => {
+            g.ld_reg(RAX, r);
+            g.add_imm(RAX, next_pc);
+            g.load(if half { 2 } else { 1 }, false, idx);
+            g.a.sh_i(Sh::Shl, RAX, 1);
+            g.add_imm(RAX, next_pc);
+            g.ind_brk(count, true);
+        }
+        Fast::PushRet => {
+            g.ld_sp(RAX);
+            g.a.alu_ri(Alu::Sub, RAX, 4);
+            g.st_sp(RAX);
+            g.a.ld(RCX, m(CPU, off_rets() as i32));
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::PopRet => {
+            g.ld_sp(RAX);
+            g.load(4, false, idx);
+            g.ld_sp(RDX);
+            g.a.alu_ri(Alu::Add, RDX, 4);
+            g.st_sp(RDX);
+            g.ind_brk(count, true);
+        }
+        // ---- everything else: the interpreter's executor for this one op
+        other => {
+            let p: &'static Fast = Box::leak(Box::new(other));
+            g.a.mov_rr64(RDI, CTX);
+            g.a.mov_ri64(RSI, p as *const Fast as u64);
+            g.idx(RDX, idx);
+            g.a.mov_ri(RCX, next_pc);
+            g.call(op_helper::<B>(&other, profile));
+            let fall = g.a.label();
+            g.a.bt64(RAX, 32); // bit 32: jumped (target in eax)
+            g.a.jcc(Cc::Ae, fall);
+            g.ind_brk(count, true);
+            g.a.bind(fall);
+            bus_used = true;
+            if other.may_jump() {
+                // a jump through the interpreter (`pop` with pc in its mask) that fell
+                // through: leave first if the next tick is due, as after any bus access
+                g.check_brk(next_pc, count, false, 0);
+                g.chain(next_pc, count);
+            }
+        }
+    }
+    bus_used
+}
+
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
-pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64, stops: Option<bool>) -> Option<(Vec<u8>, usize)> {
     let mut a = Asm::new();
     let exit = a.label();
     let mut g = Gen {
@@ -357,9 +910,9 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
-        h_op: if profile { h_op::<B, true> as *const () as u64 } else { h_op::<B, false> as *const () as u64 },
+        h_pair: h_pair::<B> as *const () as u64,
         itab,
-        pred: None,
+        stops: stops.is_some(),
     };
     // prologue (entry from Rust: rdi cpu, rsi ctx, rdx ram, rcx xip, r8d limit, r9 code flags);
     // chained blocks enter at the body. Six pushes and the frame keep rsp 16-byte aligned for
@@ -376,10 +929,33 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
     g.a.mov_rr64(FLAGS, R9);
     g.a.mov_ri(DONE, 0);
     let body = g.a.here();
+    // (a runner's stretch, as the AArch64 code)
+    if let Some(whole) = stops {
+        let (go, stop) = (g.a.label(), g.a.label());
+        g.a.test_rr(DONE, DONE);
+        g.a.jcc(Cc::E, go);
+        g.a.ld(R11, m(CPU, off_stop_pc() as i32));
+        g.a.test_rr(R11, R11);
+        g.a.jcc(Cc::E, go);
+        if whole {
+            let bytes: u32 = ops.iter().map(|o| o.len as u32).sum();
+            g.a.alu_ri(Alu::Sub, R11, pc0);
+            g.a.alu_ri(Alu::Cmp, R11, bytes);
+            g.a.jcc(Cc::B, stop);
+            g.a.cmp_m_i8(m(CPU, off_stop_io() as i32), 0);
+            g.a.jcc(Cc::Ne, stop);
+            g.a.lea(R11, m(DONE, crate::STRETCH_ROOM as i32));
+            g.a.cmp_rm(R11, m(RSP, LIMIT));
+            g.a.jcc(Cc::B, go);
+        }
+        g.a.bind(stop);
+        g.exit_imm(pc0, 0);
+        g.a.bind(go);
+    }
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
-        g.a.lea(R11, m(DONE, ops.len() as i32));
+        g.a.lea(R11, m(DONE, (insns(ops) + then.len() as u32) as i32));
         g.a.cmp_rm(R11, m(RSP, LIMIT));
         g.a.jcc(Cc::Be, fits);
         g.exit_imm(pc0, 0);
@@ -388,15 +964,19 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
 
     if !(0x0200_0000..0x0400_0000).contains(&pc0) {
         let off = pc0.wrapping_sub(mem.ram_base) as usize;
-        let len = ops.iter().map(|op| op.len as usize).sum::<usize>() + 6;
+        let len = ops.iter().chain(then).map(|op| op.len as usize).sum::<usize>() + 6;
         let len = len.min((mem.ram_len as usize).checked_sub(off)?);
         // SAFETY: jit_mem provides a live RAM allocation, and the range is checked above.
         let bytes = unsafe { std::slice::from_raw_parts(mem.ram.add(off), len) }.into();
-        guards.push(Box::new(RamGuard { pc: pc0, bytes, version: None }));
-        let guard = guards.last_mut().unwrap().as_mut();
+        guards.push(Box::new(RamGuard::new(pc0, bytes)));
+        let guard = guards.last_mut().unwrap().as_mut() as *mut RamGuard as u64;
         let valid = g.a.label();
+        // no code word written since the snapshot was last found current: no call
+        g.a.ld64(R11, m(CTX, OFF_VER as i32));
+        g.a.mov_ri64(RSI, guard);
+        g.a.cmp_rm64(R11, m(RSI, 0));
+        g.a.jcc(Cc::E, valid);
         g.a.mov_rr64(RDI, CTX);
-        g.a.mov_ri64(RSI, guard as *mut RamGuard as u64);
         g.call(h_ram_ok::<B> as *const () as u64);
         g.a.test_rr(RAX, RAX);
         g.a.jcc(Cc::Ne, valid);
@@ -404,574 +984,65 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         g.a.bind(valid);
     }
 
-    // the order the ops run in: a swapped pair's second before its head (`super::swapped_pair`)
-    let mut pcs = Vec::with_capacity(ops.len());
-    let mut q = pc0;
-    for o in ops {
-        pcs.push(q);
-        q += o.len as u32;
-    }
-    let mut order: Vec<usize> = (0..ops.len()).collect();
-    let mut k = 0;
-    while k < ops.len() {
-        if ops[k].careful && super::swapped_pair(&ops[k], ops.get(k + 1)) {
-            order.swap(k, k + 1);
-            k += 2;
-        } else {
-            k += 1;
-        }
-    }
-    // (a swapped pair's second ran: its exit check, once the head has run too)
-    let mut second_used: Option<bool> = None;
     let mut pc = pc0;
-    for (pos, &i) in order.iter().enumerate() {
-        let op = &ops[i];
-        let idx = i as u32;
-        let next_pc = pcs[i] + op.len as u32;
-        let count = idx + 1;
-        let mut bus_used = false;
-        let swapped_second = pos + 1 < order.len() && order[pos + 1] + 1 == i;
-        let swapped_head = second_used.is_some();
-        match op.fast {
-            Fast::Nop => {}
-            Fast::MovI { d, v } => {
-                g.a.st_imm(m(CPU, off_reg(d) as i32), v);
-            }
-            Fast::Mov { d, s } => {
-                g.ld_reg(RAX, s);
-                g.st_reg(RAX, d);
-            }
-            Fast::AddRI { d, s, v } => {
-                g.ld_reg(RAX, s);
-                g.add_imm(RAX, v);
-                g.st_reg(RAX, d);
-            }
-            Fast::ShlI { d, s, n } => {
-                g.ld_reg(RAX, s);
-                if n & 31 != 0 {
-                    g.a.sh_i(Sh::Shl, RAX, n & 31);
-                }
-                g.st_reg(RAX, d);
-            }
-            Fast::SarI { d, s, n } => {
-                g.ld_reg(RAX, s);
-                if n & 31 != 0 {
-                    g.a.sh_i(Sh::Sar, RAX, n & 31);
-                }
-                g.st_reg(RAX, d);
-            }
-            Fast::Alu3 { d, a, b, op } => {
-                g.ld_reg(RAX, a);
-                g.ld_reg(RCX, b);
-                g.alu(op);
-                g.st_reg(RAX, d);
-            }
-            Fast::Alu3I { d, a, v, op } => {
-                g.ld_reg(RAX, a);
-                g.a.mov_ri(RCX, v);
-                g.alu(op);
-                g.st_reg(RAX, d);
-            }
-            Fast::Alu2 { d, b, op } => {
-                g.ld_reg(RAX, d);
-                g.ld_reg(RCX, b);
-                g.alu(op);
-                g.st_reg(RAX, d);
-            }
-            Fast::Alu2I { d, v, op } => {
-                g.ld_reg(RAX, d);
-                g.a.mov_ri(RCX, v);
-                g.alu(op);
-                g.st_reg(RAX, d);
-            }
-            Fast::A4 { d, s, op, rk, rv } => {
-                g.rhs(rk, rv);
-                g.ld_reg(RAX, s);
-                g.alu(op);
-                g.st_reg(RAX, d);
-            }
-            Fast::Ext { d, s, part, signed } => {
-                g.ld_reg(RAX, s);
-                match (part, signed) {
-                    (0, false) => g.a.movzx8(RAX, RAX),
-                    (0, true) => g.a.movsx8(RAX, RAX),
-                    (1, false) => g.a.movzx16(RAX, RAX),
-                    (1, true) => g.a.movsx16(RAX, RAX),
-                    (_, false) => g.a.sh_i(Sh::Shr, RAX, 16),
-                    (_, true) => g.a.sh_i(Sh::Sar, RAX, 16),
-                }
-                g.st_reg(RAX, d);
-            }
-            Fast::MinMax { d, a, b, kind } => {
-                g.ld_reg(RAX, a);
-                g.ld_reg(RCX, b);
-                g.a.alu_rr(Alu::Cmp, RAX, RCX);
-                // b where a is not the one kept
-                let c = match kind { 0 => Cc::Ge, 1 => Cc::Le, 2 => Cc::Ae, _ => Cc::Be };
-                g.a.cmov(c, RAX, RCX);
-                g.st_reg(RAX, d);
-            }
-            // ---- branches (always a block's last op)
-            Fast::BrI { a, v, cond, target } => {
-                let t = g.a.label();
-                g.ld_reg(RAX, a);
-                g.a.mov_ri(RCX, v);
-                g.branch(cond, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::BrIEq { a, v, target } | Fast::BrINe { a, v, target } => {
-                let t = g.a.label();
-                g.ld_reg(RAX, a);
-                g.a.mov_ri(RCX, v);
-                g.branch(if matches!(op.fast, Fast::BrIEq { .. }) { Cond::Eq } else { Cond::Ne }, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::BrR { a, b, cond, target } => {
-                let t = g.a.label();
-                g.ld_reg(RAX, a);
-                g.ld_reg(RCX, b);
-                g.branch(cond, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::BitBr { r, mk, ne, mv, target } => {
-                let t = g.a.label();
-                g.rhs(mk, mv);
-                g.ld_reg(RAX, r);
-                g.a.test_rr(RAX, RCX);
-                g.a.jcc(if ne { Cc::Ne } else { Cc::E }, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::DecBr { r, cond, v, target } => {
-                let t = g.a.label();
-                g.ld_reg(RAX, r);
-                g.a.alu_ri(Alu::Sub, RAX, 1);
-                g.st_reg(RAX, r);
-                g.a.mov_ri(RCX, v);
-                g.branch(cond, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::Goto { target } => g.chain(target, count),
-            Fast::Call { target } => {
-                g.a.st_imm(m(CPU, off_rets() as i32), next_pc);
-                g.chain(target, count);
-            }
-            Fast::IfBlk { a, rk, fam, alt, has_else: true, rv, then_d, else_d } => {
-                // an if-else block (jit_wasm's plan): not taken, on at the else part; taken, the
-                // then-part the caller brought along (`Cpu::native_if_else`), then past the else
-                // part. Without it, a taken one leaves with the skip for the interpreter.
-                if g.pred.is_some() {
-                    return None; // (never: a then-part holds no careful op)
-                }
-                let then_end = next_pc.wrapping_add(then_d as u32);
-                let else_end = then_end.wrapping_add(else_d as u32);
-                let taken = g.a.label();
-                g.rhs(rk, rv);
-                g.ld_reg(RAX, a);
-                if fam == 2 {
-                    g.a.test_rr(RAX, RCX);
-                    g.a.jcc(if alt { Cc::Ne } else { Cc::E }, taken);
-                } else {
-                    g.branch(crate::cond_of_fam(fam as u64, alt), taken);
-                }
-                g.chain(then_end, count);
-                g.a.bind(taken);
-                if i + 1 == ops.len() {
-                    if then_d == 0 {
-                        // an empty then-part: its skip is taken at once
-                        g.chain(else_end, count);
-                    } else {
-                        g.a.st_imm(m(CTX, OFF_PRED as i32), then_end);
-                        g.a.st_imm(m(CTX, OFF_PRED as i32 + 4), else_end);
-                        g.exit_imm(next_pc, count);
-                    }
-                    pc = next_pc;
-                    break;
-                }
-                g.pred = Some((then_end, else_end));
-                pc = next_pc;
-                continue;
-            }
-            Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
-                // without an else part a predicated block is a conditional jump over its then part
-                let taken = g.a.label();
-                g.rhs(rk, rv);
-                g.ld_reg(RAX, a);
-                if fam == 2 {
-                    g.a.test_rr(RAX, RCX);
-                    g.a.jcc(if alt { Cc::Ne } else { Cc::E }, taken);
-                } else {
-                    g.branch(crate::cond_of_fam(fam as u64, alt), taken);
-                }
-                g.chain(next_pc.wrapping_add(then_d as u32), count);
-                g.a.bind(taken);
-                g.chain(next_pc, count);
-            }
-            // (the multiply-accumulates 7 / 8 read d too, min / max are Rust's: through the
-            // interpreter's executor)
-            Fast::FOp { d, a, b, op } if !matches!(op, 5..=8) => {
-                g.ld_reg(RAX, a);
-                match op {
-                    0..=3 => {
-                        g.ld_reg(RCX, b);
-                        g.a.movd_xr(0, RAX);
-                        g.a.movd_xr(1, RCX);
-                        let f = match op { 0 => Fop::Add, 1 => Fop::Sub, 2 => Fop::Mul, _ => Fop::Div };
-                        g.a.fop(f, 0, 1);
-                        g.a.movd_rx(RAX, 0);
-                    }
-                    0x1f => g.f2i(true),
-                    0x5f => g.f2i(false),
-                    0x8f => {
-                        g.a.cvtsi2ss(0, RAX, false);
-                        g.a.movd_rx(RAX, 0);
-                    }
-                    _ => {
-                        // u32 -> f32: the zero-extended rax as a signed 64-bit integer
-                        g.a.cvtsi2ss(0, RAX, true);
-                        g.a.movd_rx(RAX, 0);
-                    }
-                }
-                g.st_reg(RAX, d);
-            }
-            Fast::Rts => {
-                g.a.ld(RAX, m(CPU, off_rets() as i32));
-                g.exit_reg(RAX, count);
-            }
-            // ---- memory
-            Fast::Ld { d, b, off, w, signed } => {
-                match b {
-                    Base::Reg(r) => g.ld_reg(RAX, r),
-                    Base::Sp => g.ld_sp(RAX),
-                }
-                g.add_imm(RAX, off);
-                g.load(w, signed, idx);
-                g.st_reg(RAX, d);
-                bus_used = true;
-            }
-            Fast::LdW { d, b, off } => {
-                g.ld_reg(RAX, b);
-                g.add_imm(RAX, off);
-                g.load(4, false, idx);
-                g.st_reg(RAX, d);
-                bus_used = true;
-            }
-            Fast::LdWSp { d, off } => {
-                g.ld_sp(RAX);
-                g.add_imm(RAX, off);
-                g.load(4, false, idx);
-                g.st_reg(RAX, d);
-                bus_used = true;
-            }
-            Fast::LdBu { d, b, off } => {
-                g.ld_reg(RAX, b);
-                g.add_imm(RAX, off);
-                g.load(1, false, idx);
-                g.st_reg(RAX, d);
-                bus_used = true;
-            }
-            Fast::St { s, b, off, w } => {
-                match b {
-                    Base::Reg(r) => g.ld_reg(RAX, r),
-                    Base::Sp => g.ld_sp(RAX),
-                }
-                g.add_imm(RAX, off);
-                g.ld_reg(RCX, s);
-                g.store(w, idx);
-                bus_used = true;
-            }
-            Fast::StW { s, b, off } => {
-                g.ld_reg(RAX, b);
-                g.add_imm(RAX, off);
-                g.ld_reg(RCX, s);
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::StWSp { s, off } => {
-                g.ld_sp(RAX);
-                g.add_imm(RAX, off);
-                g.ld_reg(RCX, s);
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::LdIdx { d, b, i, sh, w, signed } => {
-                g.ld_reg(RAX, b);
-                g.ld_reg(RCX, i);
-                if sh & 31 != 0 {
-                    g.a.sh_i(Sh::Shl, RCX, sh & 31);
-                }
-                g.a.alu_rr(Alu::Add, RAX, RCX);
-                g.load(w, signed, idx);
-                g.st_reg(RAX, d);
-                bus_used = true;
-            }
-            Fast::StIdx { s, b, i, sh, w } => {
-                g.ld_reg(RAX, b);
-                g.ld_reg(RCX, i);
-                if sh & 31 != 0 {
-                    g.a.sh_i(Sh::Shl, RCX, sh & 31);
-                }
-                g.a.alu_rr(Alu::Add, RAX, RCX);
-                g.ld_reg(RCX, s);
-                g.store(w, idx);
-                bus_used = true;
-            }
-            Fast::LdPost { d, b, w, signed, inc } => {
-                g.ld_reg(RAX, b);
-                g.load(w, signed, idx);
-                g.st_reg(RAX, d);
-                g.ld_reg(RAX, b); // (after the load wrote d, as the interpreter)
-                g.add_imm(RAX, inc);
-                g.st_reg(RAX, b);
-                bus_used = true;
-            }
-            Fast::StPost { s, b, w, inc } => {
-                g.ld_reg(RAX, b);
-                g.ld_reg(RCX, s);
-                g.store(w, idx);
-                g.ld_reg(RAX, b);
-                g.add_imm(RAX, inc);
-                g.st_reg(RAX, b);
-                bus_used = true;
-            }
-            Fast::Rmw { b, w, op: rop, off, v } => {
-                g.ld_reg(RAX, b);
-                g.add_imm(RAX, off);
-                g.a.st(m(RSP, KEEP), RAX);
-                if let RmwOp::Mov = rop {
-                    g.a.mov_ri(RCX, v);
-                } else {
-                    g.load(w, false, idx);
-                    g.a.mov_rr(RCX, RAX);
-                    let o = match rop {
-                        RmwOp::Or => Alu::Or,
-                        RmwOp::And => Alu::And,
-                        RmwOp::Xor => Alu::Xor,
-                        RmwOp::Add => Alu::Add,
-                        RmwOp::Sub => Alu::Sub,
-                        RmwOp::Mov => unreachable!(),
-                    };
-                    g.a.alu_ri(o, RCX, v);
-                }
-                g.a.ld(RAX, m(RSP, KEEP));
-                g.store(w, idx);
-                bus_used = true;
-            }
-            Fast::MemA4 { b, off, op: aop, rk, rv } => {
-                g.rhs(rk, rv);
-                g.a.st(m(RSP, KEEP2), RCX);
-                g.ld_reg(RAX, b);
-                g.add_imm(RAX, off as u32);
-                g.a.st(m(RSP, KEEP), RAX);
-                g.load(4, false, idx);
-                g.a.ld(RCX, m(RSP, KEEP2));
-                g.alu(aop);
-                g.a.mov_rr(RCX, RAX);
-                g.a.ld(RAX, m(RSP, KEEP));
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::SpAdd { v } => {
-                g.ld_sp(RAX);
-                g.add_imm(RAX, v);
-                g.st_sp(RAX);
-            }
-            Fast::RFromSp { d, v } => {
-                g.ld_sp(RAX);
-                g.add_imm(RAX, v);
-                g.st_reg(RAX, d);
-            }
-            Fast::Mov2 { dh, dl, sh, sl } => {
-                g.ld_reg(RAX, sh);
-                g.ld_reg(RCX, sl);
-                g.st_reg(RAX, dh);
-                g.st_reg(RCX, dl);
-            }
-            Fast::Mov2I { dh, dl, v } => {
-                g.a.st_imm(m(CPU, off_reg(dl) as i32), v);
-                g.a.st_imm(m(CPU, off_reg(dh) as i32), ((v as i32) >> 31) as u32);
-            }
-            Fast::BitExt { d, s, p, l, signed } => {
-                let (p, l) = (p & 31, l & 31);
-                g.ld_reg(RAX, s);
-                if p != 0 {
-                    g.a.sh_i(Sh::Shr, RAX, p);
-                }
-                if l != 0 {
-                    if signed {
-                        g.a.sh_i(Sh::Shl, RAX, 32 - l);
-                        g.a.sh_i(Sh::Sar, RAX, 32 - l);
-                    } else {
-                        g.a.alu_ri(Alu::And, RAX, (1u32 << l) - 1);
-                    }
-                }
-                g.st_reg(RAX, d);
-            }
-            Fast::BitIns { d, s, p, l } => {
-                let (p, l) = (p as u32 & 31, l as u32 & 31);
-                let mask = if l == 0 { u32::MAX } else { (1u32 << l) - 1 };
-                g.ld_reg(RAX, s);
-                g.ld_reg(RCX, d);
-                g.a.alu_ri(Alu::And, RAX, mask);
-                if p != 0 {
-                    g.a.sh_i(Sh::Shl, RAX, p as u8);
-                }
-                g.a.alu_ri(Alu::And, RCX, !(mask << p));
-                g.a.alu_rr(Alu::Or, RAX, RCX);
-                g.st_reg(RAX, d);
-            }
-            Fast::PushRets { n } => {
-                let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
-                for r in std::iter::once(-1).chain((bot..=top).rev()) {
-                    g.ld_sp(RAX);
-                    g.a.alu_ri(Alu::Sub, RAX, 4);
-                    g.st_sp(RAX);
-                    if r < 0 {
-                        g.a.ld(RCX, m(CPU, off_rets() as i32));
-                    } else {
-                        g.ld_reg(RCX, r as u8);
-                    }
-                    g.store(4, idx);
-                }
-                bus_used = true;
-            }
-            Fast::PopPc { n } => {
-                let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
-                for r in bot..=top {
-                    g.ld_sp(RAX);
-                    g.load(4, false, idx);
-                    g.st_reg(RAX, r as u8);
-                    g.ld_sp(RAX);
-                    g.a.alu_ri(Alu::Add, RAX, 4);
-                    g.st_sp(RAX);
-                }
-                g.ld_sp(RAX);
-                g.load(4, false, idx);
-                g.ld_sp(RDX);
-                g.a.alu_ri(Alu::Add, RDX, 4);
-                g.st_sp(RDX);
-                g.exit_reg(RAX, count);
-            }
-            Fast::PopRets => {
-                g.ld_sp(RAX);
-                g.load(4, false, idx);
-                g.a.st(m(CPU, off_rets() as i32), RAX);
-                g.ld_sp(RAX);
-                g.a.alu_ri(Alu::Add, RAX, 4);
-                g.st_sp(RAX);
-                bus_used = true;
-            }
-            Fast::Tb { r, half } => {
-                g.ld_reg(RAX, r);
-                g.add_imm(RAX, next_pc);
-                g.load(if half { 2 } else { 1 }, false, idx);
-                g.a.sh_i(Sh::Shl, RAX, 1);
-                g.add_imm(RAX, next_pc);
-                g.exit_reg(RAX, count);
-            }
-            Fast::PushRet => {
-                g.ld_sp(RAX);
-                g.a.alu_ri(Alu::Sub, RAX, 4);
-                g.st_sp(RAX);
-                g.a.ld(RCX, m(CPU, off_rets() as i32));
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::PopRet => {
-                g.ld_sp(RAX);
-                g.load(4, false, idx);
-                g.ld_sp(RDX);
-                g.a.alu_ri(Alu::Add, RDX, 4);
-                g.st_sp(RDX);
-                g.exit_reg(RAX, count);
-            }
-            // ---- interrupt enables (critical sections: GHOULBOX runs ~10 M of each per second)
-            Fast::SetIe { on } => {
-                g.a.mov_ri(RAX, on as u32);
-                g.a.st8(m(CPU, off_ie() as i32), RAX);
-                if on {
-                    g.a.mov_rr64(RDI, CTX);
-                    g.call(h_irq_window::<B> as *const () as u64);
-                    bus_used = true;
-                }
-            }
-            Fast::IcfgRd { d } => {
-                g.a.mov_rr64(RDI, CPU);
-                g.call(h_icfg as *const () as u64);
-                g.st_reg(RAX, d);
-            }
-            Fast::IcfgWr { s } => {
-                g.ld_reg(RAX, s);
-                g.a.st(m(CPU, off_icfg_store() as i32), RAX);
-                g.a.mov_rr64(RDI, CTX);
-                g.call(h_irq_window::<B> as *const () as u64);
-                bus_used = true;
-            }
-            // ---- everything else: the interpreter's executor for this one op
-            other => {
-                let p: &'static Fast = Box::leak(Box::new(other));
-                g.a.mov_rr64(RDI, CTX);
-                g.a.mov_ri64(RSI, p as *const Fast as u64);
-                g.idx(RDX, idx);
-                g.a.mov_ri(RCX, next_pc);
-                g.call(g.h_op);
-                let fall = g.a.label();
-                g.a.bt64(RAX, 32); // bit 32: jumped (target in eax)
-                g.a.jcc(Cc::Ae, fall);
-                g.exit_reg(RAX, count);
-                g.a.bind(fall);
-                bus_used = true;
-                if other.may_jump() {
-                    // a branch through the interpreter (the float compares) that fell through
-                    g.chain(next_pc, count);
-                }
-            }
-        }
-        if swapped_second {
-            second_used = Some(bus_used);
+    // instructions so far (a swapped pair is two)
+    let mut ins = 0u32;
+    for op in ops {
+        let next_pc = pc + op.len as u32;
+        if let Fast::Swap { idx: s } = op.fast {
+            // a dual-issue pair run second instruction first (the pair rule's result, as
+            // `exec_careful_op` runs it whole): the second with both ticks taken, then the head
+            // (registers only); then leave if the next tick is due or an interrupt is pending,
+            // as the careful path stops after a pair
+            let (head, tail, hlen) = swaps[s as usize];
+            let mid = pc + hlen as u32;
+            emit_op::<B>(&mut g, tail, ins + 1, next_pc, profile);
+            emit_op::<B>(&mut g, head, ins, mid, profile);
+            g.check_pair(next_pc, ins + 2, insns(ops) - (ins + 2));
+            ins += 2;
+            pc = next_pc;
             continue;
         }
-        if swapped_head {
-            // the pair done: leave (if the bus asked to) after its second instruction
-            let used = second_used.take() == Some(true);
-            let (snext, scount) = (pcs[i + 1] + ops[i + 1].len as u32, count + 1);
-            if used || bus_used {
-                g.check_brk(snext, scount, false);
+        if let Fast::IfBlk { a, rk, fam, alt, has_else: true, rv, then_d, else_d } = op.fast {
+            // an if-else block with its then-part (`Jit::entry`: the block's last op): not taken,
+            // on at the else part; taken, the then-part, then past the else part. Interrupts wait
+            // through the then-part (an exit inside it leaves the skip in `Ctx::pred`, for
+            // pred_skips) and after it the careful path stops if one is pending (`check_pair`).
+            let te = next_pc.wrapping_add(then_d as u32);
+            let ee = te.wrapping_add(else_d as u32);
+            let taken = g.a.label();
+            g.if_jump(a, rk, fam, alt, rv, taken);
+            g.chain(te, ins + 1);
+            g.a.bind(taken);
+            let (mut tpc, mut j) = (next_pc, ins + 1);
+            for (k, t) in then.iter().enumerate() {
+                let tnext = tpc + t.len as u32;
+                if emit_op::<B>(&mut g, t.fast, j, tnext, profile) && k + 1 < then.len() {
+                    g.check_brk_pred(tnext, j + 1, te, ee);
+                }
+                (tpc, j) = (tnext, j + 1);
             }
-            pc = snext;
-            continue;
+            if !then.is_empty() {
+                g.check_pair(ee, j, 0);
+            }
+            g.chain(ee, j);
+            ins = j;
+            break;
         }
+        let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
             // leaving between a glued pair's two instructions: interrupts wait for the second
-            g.check_brk(next_pc, count, op.glue);
+            g.check_brk(next_pc, ins + 1, op.glue, insns(ops) - (ins + 1));
         }
+        ins += 1;
         pc = next_pc;
         if op.fast.may_jump() {
             break; // (the block's last op)
         }
     }
-    // fell off the end of the prefix (an if-else block's then-part's end: past its else part)
-    let n = ops.len() as u32;
+    // fell off the end of the prefix
     if !ops.last().map_or(false, |o| o.fast.may_jump()) {
-        match g.pred {
-            Some((te, ee)) if pc == te => g.chain(ee, n),
-            Some((te, ee)) => {
-                // (a then-part cut short: the skip goes with the exit)
-                g.a.st_imm(m(CTX, OFF_PRED as i32), te);
-                g.a.st_imm(m(CTX, OFF_PRED as i32 + 4), ee);
-                g.exit_imm(pc, n);
-            }
-            None => g.chain(pc, n),
-        }
+        g.chain(pc, ins);
     }
     g.a.bind(exit);
     g.a.alu_ri64(Alu::Add, RSP, FRAME as i8);

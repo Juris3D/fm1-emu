@@ -13,7 +13,8 @@ const { jitImports } = await import(new URL("jit.js", dir));
 let x;
 const { instance } = await WebAssembly.instantiate(readFileSync(new URL("fm1_web.wasm", dir)), { env: jitImports(() => x) });
 x = instance.exports;
-x.fm1_jit(1, 16);   // as the page runs it: hot code compiled
+x.fm1_jit(1, 16);   // as the page runs it: hot code compiled, and the even pace
+x.fm1_ahead(1024);
 const p = x.fm1_alloc(bytes.length);
 new Uint8Array(x.memory.buffer, p, bytes.length).set(bytes);
 if (x.fm1_boot_fwsc(p, bytes.length, 0, 0, 100) !== 0) {

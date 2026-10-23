@@ -82,6 +82,8 @@ enum Region {
     Crc,
     Rand,
     XipFlash,
+    /// SFCENC: the SFC's decryption and its plain window.
+    Sfcenc,
     Dbg,
     Irqc,
     /// Interrupt controller enable/priority words and software latch.
@@ -198,13 +200,24 @@ pub struct Soc {
     /// the updater gives every firmware: April OS keeps its samples at flash 0x74000, read
     /// through XIP 0x02070000, and waits at boot until it finds them or a blank chip's 0xff).
     pub xip_flash: bool,
+    /// The SFC decrypts the app area on the fly with the chip key (packages are installed
+    /// scrambled): with a key (`sfc_boot`), what the window shows from the chip (a write, a
+    /// restored flash file) is read through SFCENC: CON bit 0 decrypts, bit 1 leaves the plain
+    /// window UNENC_L..=UNENC_H (XIP addresses) as stored. No key (a bare `--bin`): the chip as
+    /// stored.
+    sfc_key: Option<u16>,
+    sfc_con: u32,
+    sfc_unenc: (u32, u32),
+    /// The window's 32-byte blocks that show the chip rather than the installed package: read
+    /// again when the firmware sets SFCENC.
+    sfc_from_flash: Vec<bool>,
     /// cpu0 released core 1: 0x10008 bit 3 (the stock firmware), or the first `|= 8` (run) on
     /// core 1's CON register 0x1EEE004 (M-VAVE's FM1 Open, after the newer AC79 SDK); latched
     /// until the runner starts cpu1, as firmwares hold the bit only while they wait for core 1
     /// to report in.
     pub cpu1_release: bool,
     /// core 1 was released once: a later run on 0x1EEE004 is the stock IPC's resume after a
-    /// pause, not a release.
+    /// pause, not a release, and a later 0 -> 1 of 0x10008 bit 3 latches nothing (core 1 runs on).
     cpu1_released_once: bool,
     /// FM1_AUDIO_TRACE: log each audio half-buffer (debugging the DMA's pace).
     audio_trace: bool,
@@ -221,6 +234,8 @@ pub struct Soc {
     pub flaky_core1: Option<flaky::FlakyCore1>,
     /// The power domain's analog registers.
     pub p33: p33::P33,
+    /// Exact skipping of cpu0's polling loops (`machine::run_blocks`).
+    pub loop_skip: machine::LoopSkip,
 }
 
 fn dbg_line(addr: u32) -> &'static str {
@@ -242,12 +257,70 @@ impl Soc {
         if !self.xip_flash {
             return;
         }
+        if self.sfc_key.is_some() {
+            // whole blocks, as the SFC decrypts them
+            let mut blk = a.max(XIP_FLASH_OFFSET) & !31;
+            while blk < b && blk - XIP_FLASH_OFFSET < self.xip.len() {
+                let i = (blk - XIP_FLASH_OFFSET) / 32;
+                if self.sfc_from_flash.len() <= i {
+                    self.sfc_from_flash.resize(i + 1, false);
+                }
+                self.sfc_from_flash[i] = true;
+                self.xip_block(blk);
+                blk += 32;
+            }
+            return;
+        }
         for o in a.max(XIP_FLASH_OFFSET)..b {
             match self.xip.get_mut(o - XIP_FLASH_OFFSET) {
                 Some(x) => *x = self.flash.mem[o],
                 None => break,
             }
         }
+    }
+
+    /// Flash offset `o` is read through the SFC's decryption: CON bit 0, outside the plain
+    /// window when bit 1 sets one.
+    fn sfc_scrambled(&self, o: usize) -> bool {
+        let x = XIP_BASE + (o - XIP_FLASH_OFFSET) as u32;
+        self.sfc_con & 1 != 0 && !(self.sfc_con & 2 != 0 && (self.sfc_unenc.0..=self.sfc_unenc.1).contains(&x))
+    }
+
+    /// The 32-byte block at flash offset `blk` into the XIP window, decrypted where the SFC
+    /// decrypts (as fwsc::unscramble: the key mixed with the block's place in the app area).
+    fn xip_block(&mut self, blk: usize) {
+        let i = blk - XIP_FLASH_OFFSET;
+        let n = 32.min(self.xip.len() - i).min(self.flash.mem.len() - blk);
+        let mut b = [0u8; 32];
+        b[..n].copy_from_slice(&self.flash.mem[blk..blk + n]);
+        if let Some(key) = self.sfc_key.filter(|_| self.sfc_scrambled(blk)) {
+            fwsc::unmask(&mut b[..n], key ^ (i >> 2) as u16);
+        }
+        self.xip[i..i + n].copy_from_slice(&b[..n]);
+    }
+
+    /// SFCENC changed: the blocks that show the chip, read through the new setting.
+    fn sfc_reread(&mut self) {
+        if self.sfc_key.is_none() {
+            return;
+        }
+        for i in 0..self.sfc_from_flash.len() {
+            if self.sfc_from_flash[i] {
+                self.xip_block(XIP_FLASH_OFFSET + 32 * i);
+            }
+        }
+    }
+
+    /// A package boot: the chip key, and SFCENC as the loader leaves it for the installed
+    /// package (decrypted up to flash `app_end`, the app area's end, and as stored above:
+    /// CON 3, UNENC_L there, UNENC_H 0x07FFFFFF). The firmware's own window replaces it
+    /// (Felucca's fm1_flash.h: CON &= ~2, UNENC_L / _H, CON |= 2; stock 0x93000, FM1 Open
+    /// 0x73000, April OS 0x64000); a `--flash` file restored after this reads the same way.
+    pub fn sfc_boot(&mut self, key: u16, app_end: usize) {
+        self.sfc_key = Some(key);
+        self.write32(0x4030c, XIP_BASE + (app_end - XIP_FLASH_OFFSET) as u32);
+        self.write32(0x40308, 0x07ff_ffff);
+        self.write32(0x40300, 3);
     }
 
     /// A saved flash chip in place of the booted one (fm1-live --flash): each 4 KiB sector that
@@ -289,10 +362,47 @@ impl Soc {
             cpu1_released_once: false,
             audio_trace: std::env::var_os("FM1_AUDIO_TRACE").is_some(),
             xip_flash: true,
+            sfc_key: None,
+            sfc_con: 0,
+            sfc_unenc: (0, 0),
+            sfc_from_flash: Vec::new(),
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
             unknown_log: Vec::new(),
             flaky_core1: None,
             p33: Default::default(),
+            // (FM1_TRACE: a trace shows every instruction as it runs, not a probe's)
+            loop_skip: machine::LoopSkip::new(std::env::var_os("FM1_NO_LOOPSKIP").is_none() && std::env::var_os("FM1_TRACE").is_none()),
+        }
+    }
+
+    /// Does a 32-bit load from `addr` only look (no side effect, nothing that depends on the
+    /// clock)? `read32_slow` region by region; byte and halfword loads outside RAM read the
+    /// aligned word. What a polling loop may read and still go round unchanged.
+    pub(crate) fn pure_read(&self, addr: u32) -> bool {
+        let fm1 = self.board == Board::Fm1;
+        match self.region(addr) {
+            Region::Xip | Region::XipFlash | Region::Ram | Region::Ovl | Region::Sram2 => true,
+            Region::Irqc | Region::Iomap | Region::Usb | Region::Clk | Region::Ana | Region::Bt | Region::Dbg => true,
+            Region::Spi2 | Region::Crc | Region::P33 | Region::Alnk | Region::Uart1 | Region::Sfcenc => true,
+            // the tick counter's word counts the clock
+            Region::Irqc2 => addr != 0x1eef0f0,
+            // the timers' control and period words; the counters count the clock, and other
+            // words tick `Soc::ticks`
+            Region::Timer => matches!(addr, 0x10800 | 0x10900 | 0x10908) || matches!(addr & !0x300, 0x10400 | 0x10408),
+            // the SMK-37's matrix rows and SPI1 busy follow the clock; its ADC is left alone too
+            Region::Gpio | Region::Adc | Region::Spi1 => fm1,
+            Region::Spi0 | Region::Rand | Region::Unknown => false,
+        }
+    }
+
+    /// May a polling loop's round store to `addr` (a 32-bit store; byte and halfword stores
+    /// outside RAM write the aligned word)? Only where the round's effect is compared after it:
+    /// the P33 port, and the FM-1's SARADC (its conversions are instant).
+    pub(crate) fn loop_write_ok(&self, addr: u32) -> bool {
+        match self.region(addr) {
+            Region::P33 => true,
+            Region::Adc => self.board == Board::Fm1 && matches!(addr, 0x13100 | 0x13104),
+            _ => false,
         }
     }
 
@@ -400,6 +510,7 @@ impl Soc {
             return match addr {
                 0x50000..=0x501ff => Region::Gpio,
                 0x51000..=0x5103f => Region::Iomap,
+                0x40300..=0x4030f => Region::Sfcenc,
                 // the second USB PHY (the SMK-37's LED commons at 0x16A0C, its pads used as GPIO;
                 // its stock firmware powers the PHY up at boot and waits for 0x16800 bit 4). The
                 // FM-1's stock firmware touches the block too, as before: unknown.
@@ -680,6 +791,7 @@ impl Soc {
                 u32::from_le_bytes([g(o), g(o + 1), g(o + 2), g(o + 3)])
             }
             Region::Ram => self.ram.read32(addr - RAM_BASE),
+            Region::Sfcenc => self.sfr_get(addr),
             Region::XipFlash => {
                 let o = (addr - XIP_BASE) as usize + XIP_FLASH_OFFSET;
                 let g = |i: usize| self.flash.mem.get(i).copied().unwrap_or(0xff);
@@ -850,7 +962,9 @@ impl Soc {
                 }
             }
             Region::Clk => {
-                if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 {
+                if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 && !self.cpu1_released_once {
+                    // (once, as C1_CON's: set again later, with core 1 running, nothing would take
+                    // the latch, and the runner would stop cpu0 after every block call)
                     self.cpu1_released_once = true;
                     self.cpu1_release = true;
                     self.periph.next_due = 0; // the runner looks at it before the next instruction
@@ -904,6 +1018,16 @@ impl Soc {
                 }
                 self.sfr_set(addr, value);
             }
+            Region::Sfcenc => {
+                match addr {
+                    0x40300 => self.sfc_con = value & 0xff,
+                    0x40308 => self.sfc_unenc.1 = value,
+                    0x4030c => self.sfc_unenc.0 = value,
+                    _ => {}
+                }
+                self.sfr_set(addr, value);
+                self.sfc_reread();
+            }
             Region::Unknown => self.log_unknown(addr, 4, true, value),
         }
     }
@@ -920,6 +1044,10 @@ pub struct Stock {
     /// The board the package is for (its identity), with its identity.
     pub board: Board,
     pub identity: String,
+    /// The chip key the package's app area is scrambled with.
+    pub key: u16,
+    /// The app area's end in flash: decrypted up to here as installed (`Soc::sfc_boot`).
+    pub app_end: usize,
     /// FM-1 user bank, if this package has one.
     pub usr: Option<usize>,
 }
@@ -940,7 +1068,7 @@ pub fn stock_from_package(pkg: &[u8], syx: Option<&[u8]>) -> Result<Stock, Strin
     }
     let app = u.entry("app.bin").map(|h| h.offset).unwrap_or(0x120);
     let usr = fwsc::usr_offset(&u).filter(|_| board == Board::Fm1);
-    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, usr })
+    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, key: u.key, app_end: u.area + u.size, usr })
 }
 
 /// Ready a Soc for a package's firmware: its board, its flash chip, and the SPL's boot
@@ -997,6 +1125,7 @@ mod tests {
             0x12e00..=0x12e3f => Region::Alnk,
             0x50000..=0x501ff => Region::Gpio,
             0x51000..=0x5103f => Region::Iomap,
+            0x40300..=0x4030f => Region::Sfcenc,
             0x10000..=0x1001f => Region::Clk,
             0x10400..=0x1091f => Region::Timer,
             0x11c00..=0x11c1f => Region::Spi0,
@@ -1025,6 +1154,52 @@ mod tests {
                 assert_eq!(soc.region(a), region_chain(&soc, a), "{a:#x} on {board:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_sfc_decrypts_below_the_plain_window() {
+        // a package's app area (flash 0x4000..0x7000) and a flash file from a run before, with
+        // blocks scrambled as an updater writes them (fwsc::unscramble's cipher, its own inverse)
+        let key = 0x980f;
+        let mut soc = Soc::new(64 * 1024, vec![0xff; 0x20000]);
+        soc.xip_flash = true;
+        soc.sfc_boot(key, 0x7000);
+        let plain: Vec<u8> = (0..0x1000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let scrambled = |at: usize| -> Vec<u8> {
+            let mut b = plain.clone();
+            for blk in (0..b.len()).step_by(32) {
+                fwsc::unmask(&mut b[blk..blk + 32], key ^ ((at + blk - XIP_FLASH_OFFSET) >> 2) as u16);
+            }
+            b
+        };
+        let mut image = soc.flash.mem.clone();
+        image[0x5000..0x6000].copy_from_slice(&scrambled(0x5000));
+        image[0x7000..0x8000].copy_from_slice(&scrambled(0x7000));
+        image[0x9000..0x9004].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        soc.restore_flash(&image);
+        assert_eq!(&soc.xip[0x1000..0x2000], &plain[..], "the app area: decrypted, as the loader leaves the SFC");
+        assert_ne!(&soc.xip[0x3000..0x4000], &plain[..], "past the app area: as stored");
+        assert_eq!(soc.read32(XIP_BASE + 0x5000), 0x7856_3412);
+        // the firmware's own window, from flash 0x8000 (as Felucca's fm1_flash.h sets it)
+        let con = soc.read8(0x40300);
+        soc.write8(0x40300, con & !2);
+        soc.write32(0x4030c, XIP_BASE + 0x8000 - XIP_FLASH_OFFSET as u32);
+        soc.write32(0x40308, 0x07ff_ffff);
+        let con = soc.read8(0x40300);
+        soc.write8(0x40300, con | 2);
+        assert_eq!(soc.read8(0x40300), 3, "decrypt (as the loader left it) and the plain window");
+        assert_eq!(&soc.xip[0x3000..0x4000], &plain[..], "below the firmware's window: decrypted now");
+        assert_eq!(&soc.xip[0x1000..0x2000], &plain[..]);
+        assert_eq!(soc.read32(XIP_BASE + 0x5000), 0x7856_3412, "in the window: as stored");
+        // a write below the window reaches XIP decrypted; in it, as stored
+        soc.flash.mem[0x6000..0x7000].copy_from_slice(&scrambled(0x6000));
+        soc.flash.changed = Some((0x6000, 0x7000));
+        soc.sync_xip();
+        assert_eq!(&soc.xip[0x2000..0x3000], &plain[..], "written below the plain window: decrypted");
+        soc.flash.mem[0xa000..0xa004].copy_from_slice(&[1, 2, 3, 4]);
+        soc.flash.changed = Some((0xa000, 0xa004));
+        soc.sync_xip();
+        assert_eq!(soc.read32(XIP_BASE + 0x6000), 0x0403_0201, "written in the plain window: as stored");
     }
 
     #[test]

@@ -36,6 +36,11 @@ impl Ram {
         self.code.as_ptr()
     }
 
+    /// Is the word a store at offset `a` starts in marked as code (a store there counts)?
+    pub fn is_code(&self, a: u32) -> bool {
+        self.code.get(a as usize >> 2).is_some_and(|&c| c != 0)
+    }
+
     #[inline(always)]
     fn wrote(&mut self, a: usize) {
         if self.code[a >> 2] != 0 {
@@ -89,6 +94,12 @@ impl Ram {
     pub fn write32(&mut self, addr: u32, value: u32) {
         let a = addr as usize;
         self.wrote(a);
+        self.data[a..a + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// A word put back as it was (the polling-loop probe undoing its stores): not counted.
+    pub(crate) fn restore32(&mut self, addr: u32, value: u32) {
+        let a = addr as usize;
         self.data[a..a + 4].copy_from_slice(&value.to_le_bytes());
     }
 

@@ -89,7 +89,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
   const run = new Function(...Object.keys(environment), `return (async () => { ${source}\nreturn {
     startAudio, boot, flushRunning, setLatency, get running() { return running; },
     setFirmware(id) { fw = byId.get(id); fwSel.value = id; }, setBank(bytes) { bank = bytes; },
-    get fw() { return fw; }
+    get fw() { return fw; }, perf, setMhz(c) { mhz = c; }, get bootSeq() { return bootSeq; }
   }; })()`);
   const api = await run(...Object.values(environment));
   return { api, disk, elements, location, expireBoot: () => bootTimer(), get audio() { return audio; } };
@@ -198,4 +198,32 @@ test('a boot timeout cancels the machine and the next firmware selection recover
   assert.ok(p.audio.messages.some(m => m.type === 'cancel-boot'));
   p.audio.hangBoot = false; p.api.setFirmware('b');
   assert.equal(await p.api.boot(), true);
+});
+
+test('the status line and the report give the emulation speed and the JIT; idle firmwares get no lower clock', async () => {
+  const p = await page(); await p.api.startAudio(); await p.api.boot(); await settle();
+  const jit = { regions: 812, failed: 1, error: 'CompileError: x', compileMs: 40, compileMaxMs: 1.5 };
+  // a second's worth of quanta: 345 of them, 2.9 ms of audio each; 400 ms busy for 1000 ms emulated
+  p.audio.port.onmessage({ data: { type: 'frame', seq: p.api.bootSeq, lcd: null, leds: new Float32Array(41), ms: 5000,
+    short: 3, halted: false, jit, playing: true, busy: 400, worst: 2.5, emulated: 1000, idle: 830, quanta: 345, frames: 128 } });
+  const status = p.elements.get('status').textContent;
+  assert.match(status, /2\.5x real time · load 40%/);
+  assert.doesNotMatch(status, /instructions/);
+  const report = p.api.perf.report();
+  assert.match(report, /^speed \(emulated time per time spent emulating, last 1 s\): 2\.50x real time$/m);
+  assert.match(report, /^jit: 812 regions compiled, 1 failed \(CompileError: x\) · compiling took 40 ms, the longest 1\.5 ms$/m);
+  assert.match(report, /idle skipped: 83% of the time/);
+  assert.match(report, /worst quantum since the audio started 2\.5 ms/);
+  assert.doesNotMatch(report, /instructions/);
+  // M-VAVE's firmware (83% idle at 240 MHz): its work is the same at 60 MHz, so no lower clock
+  p.api.setMhz(240);
+  assert.equal(p.api.perf.lowerClock(1.3), null);
+  // a community firmware (10% idle): a lower clock helps, the highest that brings the load to ~80%
+  p.api.perf.idleShare = 0.1;
+  assert.equal(p.api.perf.lowerClock(1.2), 120);
+  assert.equal(p.api.perf.lowerClock(0.9), 160);
+  // too slow even at 60 MHz: still the lowest, it needs much less there
+  assert.equal(p.api.perf.lowerClock(3), 60);
+  p.api.setMhz(80);
+  assert.equal(p.api.perf.lowerClock(1.2), null);    // (60 MHz would save only ~13%)
 });

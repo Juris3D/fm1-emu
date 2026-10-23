@@ -160,3 +160,45 @@ test('a firmware without a user bank still boots when a DX7 bank is selected', a
   assert.ok(h.messages.some(m => m.type === 'booted' && m.seq === 2));
   assert.equal(h.messages.some(m => m.type === 'error'), false);
 });
+
+test('boot turns on the even pace and boots with 20 ms of emulated time per quantum', async () => {
+  const h = harness(), x = h.p.x;
+  let ahead = null;
+  Object.assign(x, { fm1_alloc: () => 1000, fm1_jit() {}, fm1_ahead(f) { ahead = f; }, fm1_boot_fwsc: () => 0,
+    fm1_board: () => 0, fm1_flash_base: () => 140000 });
+  h.p.module = {};
+  h.context.WebAssembly = { instantiate: async () => ({ exports: x }) };
+  await h.p.port.onmessage({ data: { type: 'boot', seq: 2, mhz: 100, package: new Uint8Array(960).buffer } });
+  assert.equal(ahead, 1024);
+  assert.equal(h.p.budget, 100e6 * 0.02);
+  assert.equal(h.p.playing, false);
+  await h.p.port.onmessage({ data: { type: 'boot', seq: 3, mhz: 100, ahead: 0, package: new Uint8Array(960).buffer } });
+  assert.equal(ahead, 0);
+});
+
+test('once audio plays a quantum may run 1.5 quanta; the worst quantum counts only those', () => {
+  const h = harness(), budgets = [];
+  let ms = 0, have = 0;
+  Object.assign(h.p, { mhz: 240, ahead: 1024, budget: 240e6 * 0.02, playing: false, timedMs: 0 });
+  // booting: no audio and slow quanta; then audio, quick quanta
+  Object.assign(h.p.x, { fm1_ms: () => ms,
+    fm1_render(n, budget) { budgets.push(budget); ms += have ? 3 : 20; h.advance(have ? 1 : 9); return have; } });
+  for (let i = 0; i < 5; i++) h.render();
+  have = 128;
+  for (let i = 0; i < 30; i++) h.render();
+  assert.deepEqual(budgets.slice(0, 6), Array(6).fill(240e6 * 0.02));
+  assert.ok(Math.abs(budgets[6] - 240e6 * 1.5 * 128 / 44100) < 1e-6);
+  assert.equal(budgets.at(-1), budgets[6]);
+  const frames = h.messages.filter(m => m.type === 'frame');
+  assert.equal(frames[0].playing, true);
+  // the second report times the first interval: 5 boot quanta (9 ms, 20 ms emulated each), 7 playing
+  assert.equal(frames[1].emulated, 5 * 20 + 7 * 3);
+  assert.ok(frames[1].worst < 9, `worst ${frames[1].worst}`);
+  assert.ok(frames[1].busy > 5 * 9);
+  // without the pace (?ahead=0) a quantum may need a whole half buffer's time: no cap
+  const off = harness(), seen = [];
+  Object.assign(off.p, { mhz: 240, ahead: 0, budget: 240e6 * 0.02, playing: false });
+  off.p.x.fm1_render = (n, budget) => { seen.push(budget); return n; };
+  off.render(); off.render();
+  assert.deepEqual(seen, [240e6 * 0.02, 240e6 * 0.02]);
+});

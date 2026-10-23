@@ -8,7 +8,8 @@
 //! The emulator runs on its own thread, paced to the wall clock: its
 //! emulated time stays a little ahead of real time and the I2S output is
 //! streamed to the default audio device. The window is the FM-1's front
-//! panel (panel.rs): click or drag across the keys, click buttons, drag a
+//! panel (panel.rs): click or drag across the keys (lower on a key = harder: the velocity
+//! its pill lands at; dragging down on a held key = pressing it harder), click buttons, drag a
 //! knob up/down or scroll over it; MASTER is the volume pot. Button and key
 //! LEDs follow the firmware's LED lines.
 //!
@@ -190,12 +191,14 @@ impl Machine {
         cpu.regs[0] = params;
         if let Some(st) = &stock {
             cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
+            soc.sfc_boot(st.key, st.app_end);
         }
         if let Some(path) = o.flash.as_ref().filter(|p| std::path::Path::new(p).exists()) {
             let f = std::fs::read(path)?;
             if f.len() != fm1_soc::FLASH_SIZE {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path}: not a {} byte flash image", fm1_soc::FLASH_SIZE)));
             }
+            // (through the SFC as the loader leaves it, and again when the firmware sets its window)
             soc.restore_flash(&f);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
@@ -341,6 +344,10 @@ fn bench(o: &Opts, ms: u64) {
     if let Some(c1) = &m.cpu1 {
         println!("cpu1: {} instructions ({:.1} M per emulated s)", c1.insn_count, c1.insn_count as f64 / 1e3 / ms as f64);
     }
+    let ls = &m.soc.loop_skip;
+    if ls.enabled {
+        println!("loop skip: {:.1}% of cycles ({} probes, {} found a loop)", 100.0 * ls.skipped as f64 / m.soc.periph.cycles.max(1) as f64, ls.probes, ls.hits);
+    }
     if let Some(f) = &m.soc.flaky_core1 {
         println!("flaky core 1: {} misreads in {} RAM loads", f.misreads, f.loads);
     }
@@ -453,7 +460,8 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
 /// Headless panel picture: C4-E4-G4 held from 0.8 s, PLAY pressed at 1.2 s,
 /// the panel drawn at `ms` into work/panel.ppm.
 /// FM1_BENCH_KEYS=ms:id[,ms:id^,ms:eN:clicks...]: queue key presses (`^`: release) and
-/// encoder turns, `ms:mHEX` MIDI bytes into the MIDI IN jack. False when the variable is unset.
+/// encoder turns, `ms:mHEX` MIDI bytes into the MIDI IN jack (`@FILE`: the script from FILE).
+/// False when the variable is unset.
 /// --flash: the flash chip back to its file; and how many erases / programs it saw
 fn save_flash(m: &Machine, path: Option<&String>) {
     let f = &m.soc.flash;
@@ -477,8 +485,15 @@ fn halted(e: &str) {
 }
 
 fn script_keys(m: &mut Machine) -> bool {
-    let Ok(keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
-    fm1_soc::script::queue(&mut m.soc, &keys);
+    let Ok(mut keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
+    if let Some(path) = keys.strip_prefix('@') {
+        // (@FILE: the script from a file; a deploy of a whole firmware is megabytes of MIDI)
+        keys = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("FM1_BENCH_KEYS {path}: {e}");
+            String::new()
+        });
+    }
+    fm1_soc::script::queue(&mut m.soc, keys.trim());
     true
 }
 
@@ -711,6 +726,7 @@ env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted i
      FM1_BENCH_ROUTES      --bench: no default keys, the steady-speed start, a thread, checkpoints, profiles
      FM1_KEY_AT, FM1_KEY_UP, FM1_NO_PLAY, FM1_NO_SKIP, FM1_SKIP_FROM, FM1_DUMP=ADDR  --shot
      FM1_NO_JIT            the interpreter (byte-identical, slower); FM1_NO_BLOCKS: a step at a time
+     FM1_NO_LOOPSKIP       run polling loops round by round instead of skipping them (byte-identical, slower)
      FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)";
 
 fn main() {
@@ -877,9 +893,10 @@ fn main() {
     let mut shown_leds = [0f32; 41];
     let mut grab: Option<Ctl> = None;
     let mut was_pressed = false;
+    let mut mouse_vel = 0u8;                    // the key under the mouse: how hard (its height; lower = harder)
     let (mut last_y, mut drag_acc) = (0f32, 0f32);
     let mut last_title = Instant::now();
-    eprintln!("mouse: click/drag the keys, click buttons, drag or scroll the knobs (MASTER = volume)");
+    eprintln!("mouse: click/drag the keys (lower = harder; drag down on a held key = aftertouch), click buttons, drag or scroll the knobs (MASTER = volume)");
     eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
@@ -897,12 +914,23 @@ fn main() {
                 grab = panel::hit(mx, my);
                 last_y = my;
                 drag_acc = 0.0;
+                if let Some(Ctl::Key(k)) = grab {
+                    mouse_vel = panel::key_vel(k, my);
+                }
             } else if pressed {
                 match grab {
-                    // glissando: the held note follows the pointer across keys
-                    Some(Ctl::Key(_)) => {
+                    // glissando: the held note follows the pointer across keys; on the same key,
+                    // its height is the pressure (aftertouch)
+                    Some(Ctl::Key(k0)) => {
                         if let Some(Ctl::Key(k)) = panel::hit(mx, my) {
-                            grab = Some(Ctl::Key(k));
+                            let v = panel::key_vel(k, my);
+                            if k != k0 {
+                                grab = Some(Ctl::Key(k));
+                                mouse_vel = v;
+                            } else if v.abs_diff(mouse_vel) >= 4 {
+                                mouse_vel = v;
+                                let _ = tx.send(Action::Pressure { id: k, vel: v });
+                            }
                         }
                     }
                     Some(Ctl::Enc(i)) => {
@@ -968,6 +996,11 @@ fn main() {
         for id in 0..41 {
             if want[id] != down[id] {
                 down[id] = want[id];
+                if want[id] && id >= 14 {
+                    // the mouse's key at its height, the computer keyboard's at 100
+                    let mouse = matches!(grab, Some(Ctl::Key(k)) if k as usize == id);
+                    let _ = tx.send(Action::KeyVel { vel: if mouse { mouse_vel } else { 100 } });
+                }
                 let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
             }
         }

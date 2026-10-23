@@ -2,6 +2,10 @@
 // FM1_BENCH_KEYS uses the native timestamped key/encoder/MIDI script syntax.
 // FM1_BENCH_NOKEYS=1 disables the default chord; FM1_WARMUP_MS=1000 separates warm-up.
 // FM1_WASM selects an A/B build. FM1_BENCH_JSON writes machine-readable results.
+// The page's audio schedule (web/worklet.js): FM1_AHEAD=frames run ahead (fm1_ahead; default as
+// the page, 0 off), FM1_CAP=0 keeps the boot budget of 20 ms of emulated time per quantum after
+// audio starts (the page caps it to 1.5 quanta when it runs ahead). "over" counts steady quanta that took longer
+// than the 2.9 ms they stand for: at 1x those are where a device of this speed drops out.
 import { readFileSync, writeFileSync } from "node:fs";
 import { jitImports } from "./jit.js";
 const mhz = +(process.argv[2] || 240), secs = +(process.argv[3] || 6);
@@ -15,6 +19,13 @@ const stats = { regions: 0, failed: 0, compileMs: 0, compileMaxMs: 0, bytes: 0 }
 const { instance } = await WebAssembly.instantiate(wasm, { env: jitImports(() => x, stats) });
 x = instance.exports;
 if (!process.env.FM1_NO_JIT) x.fm1_jit(1, +(process.env.FM1_JIT_PER || 16));
+const ahead = +(process.env.FM1_AHEAD ?? 1024);
+if (x.fm1_ahead) x.fm1_ahead(ahead);
+else if (ahead) console.error("this build has no fm1_ahead: quanta run only for their own frames");
+// as the worklet: 20 ms of emulated time per quantum while booting, 1.5 quanta once audio plays
+const bootBudget = Math.ceil(mhz * 1e6 * 0.02), playBudget = Math.ceil(mhz * 1e6 * 1.5 * 128 / 44100);
+const cap = process.env.FM1_CAP !== "0" && !!x.fm1_ahead && ahead > 0;
+let budget = bootBudget;
 const fw = readFileSync(process.env.FM1_FWSC || process.env.FM1_FW || new URL("../work/felucca_xip.bin", import.meta.url));
 const p = x.fm1_alloc(fw.length);
 new Uint8Array(x.memory.buffer, p, fw.length).set(fw);
@@ -41,7 +52,8 @@ while (x.fm1_ms() < secs * 1000) {
     warmupJit = { ...stats, tableSlots: x.__indirect_function_table.length, memoryBytes: x.memory.buffer.byteLength };
   }
   const start = performance.now();
-  const have = x.fm1_render(128, Math.ceil(mhz * 1e6 * 0.02));
+  const have = x.fm1_render(128, budget);
+  if (have && cap) budget = playBudget;
   const elapsed = performance.now() - start;
   durations.push(elapsed);
   if (steadyStart !== undefined) steady.push(elapsed);
@@ -61,9 +73,12 @@ const percentiles = values => {
   const p = n => a[Math.max(0, Math.ceil(a.length * n) - 1)] ?? null;
   return { p50: p(.5), p95: p(.95), p99: p(.99), max: p(1) };
 };
-const result = { mhz, requestedMs: secs * 1000, emulatedMs, wallSeconds: wall,
+const idleMs = x.fm1_idle_ms ? x.fm1_idle_ms() : null;
+const quantumMs = 128 / 44.1, over = steady.filter(d => d > quantumMs).length;
+const result = { mhz, ahead: x.fm1_ahead ? ahead : 0, cap, requestedMs: secs * 1000, emulatedMs, wallSeconds: wall,
   realtime: emulatedMs / 1000 / wall, audioFrames: real, audioRealtime: real / 44100 / wall,
   shortQuanta: short, renderMs: percentiles(durations), steadyRenderMs: percentiles(steady),
+  steadyQuanta: steady.length, steadyOver: over, idleShare: idleMs === null ? null : idleMs / emulatedMs,
   steadyRealtime: steadyStart === undefined ? null : (emulatedMs - steadyMs) / (end - steadyStart),
   steadyAudioFrames: real - steadyFrames, jit: stats, warmupJit, memoryStart, memoryEnd: x.memory.buffer.byteLength,
   tableSlots: x.__indirect_function_table.length, script };
@@ -77,6 +92,9 @@ if (out) {
   writeFileSync(process.argv[4], bytes);
 }
 if (process.env.FM1_BENCH_JSON) writeFileSync(process.env.FM1_BENCH_JSON, JSON.stringify(result, null, 2) + "\n");
-console.log(`${(emulatedMs / 1000).toFixed(3)} s emulated at ${mhz} MHz in ${wall.toFixed(2)} s: ${result.realtime.toFixed(2)}x real time, ` +
-  `${(x.fm1_minsns() / wall).toFixed(0)} M budgeted instructions/s (${real} real frames, ${short} short quanta)`);
+const ms = v => v === null ? "?" : v.toFixed(2);
+console.log(`${(emulatedMs / 1000).toFixed(3)} s emulated at ${mhz} MHz in ${wall.toFixed(2)} s: ${result.realtime.toFixed(2)}x real time ` +
+  `(${real} real frames, ${short} short quanta); steady quanta p50 ${ms(result.steadyRenderMs.p50)} p99 ${ms(result.steadyRenderMs.p99)} ` +
+  `max ${ms(result.steadyRenderMs.max)} ms, ${over} of ${steady.length} over ${quantumMs.toFixed(1)} ms` +
+  (idleMs === null ? "" : `; ${Math.round(100 * result.idleShare)}% of the time idle skipped`));
 console.log(JSON.stringify(result));

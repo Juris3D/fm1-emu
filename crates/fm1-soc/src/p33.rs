@@ -21,11 +21,18 @@ pub struct P33 {
     addr: u16,
     /// main domain at 0..0x400, RTC domain (CON bit 8) at 0x400..0x800
     regs: Box<[u8; 0x800]>,
+    /// register writes that changed a value (`snap`)
+    changed: u64,
 }
+
+/// The port in brief (`P33::snap`): equal snaps of one port taken at two times are the same
+/// port (its registers change only together with `changed`, which only counts up).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Snap(u32, u32, u8, u8, u16, u64);
 
 impl Default for P33 {
     fn default() -> Self {
-        Self { con: 0, dat: 0, step: 0, cmd: 0, addr: 0, regs: Box::new([0; 0x800]) }
+        Self { con: 0, dat: 0, step: 0, cmd: 0, addr: 0, regs: Box::new([0; 0x800]), changed: 0 }
     }
 }
 
@@ -40,6 +47,10 @@ impl P33 {
 
     fn index(addr: u16, rtc: bool) -> usize {
         (addr as usize & 0x3ff) | if rtc { 0x400 } else { 0 }
+    }
+
+    pub fn snap(&self) -> Snap {
+        Snap(self.con, self.dat, self.step, self.cmd, self.addr, self.changed)
     }
 
     pub fn read(&self, addr: u32) -> u32 {
@@ -83,12 +94,16 @@ impl P33 {
                     return self.regs[i];
                 }
                 let r = &mut self.regs[i];
-                *r = match (self.cmd >> 5) & 3 {
+                let v = match (self.cmd >> 5) & 3 {
                     0 => b,
                     1 => *r | b,
                     2 => *r & b,
                     _ => *r ^ b,
                 };
+                if v != *r {
+                    *r = v;
+                    self.changed += 1;
+                }
                 0
             }
             _ => 0,

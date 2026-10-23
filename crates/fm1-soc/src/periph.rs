@@ -33,8 +33,24 @@
 //! * the key/encoder matrix: 11 columns from two 74HC595s (PA4 SER, PA3
 //!   SRCLK, PA1 RCLK, MSB first, a low bit selects the column), rows PA0,
 //!   PA5-PA8, PB7 with pull-ups (low = closed).
+//! * the keys' carbon pills (as Velo, charlesvestal/fm1-velocity, and CS-1 sense them): rows PA7 / PA8 are also SARADC
+//!   channels 0 / 1. A conversion there reads the key of that row in the latched column as a
+//!   divider: the pill (its resistance falling with the force on it, ~100 ohm pressed firmly)
+//!   in series with the matrix diode and the 595's low output (together 186 counts), against the
+//!   row's 10k pull-up, or against the pin's own driver when the row is driven high (its strength
+//!   from HD0 / HD: ~312 / 132 / 51 / 35 ohm, so that a firm press reads 389 / 547 / 740 / 805 as
+//!   CS-1 measured on an FM-1). Open: 1023; driven low: 0. A press (Action::Key, at the velocity
+//!   of Action::KeyVel) lands in 1.5 ms at a force of 0.33 + 0.67 vel / 127 (the pill: 100 ohm at
+//!   1, ~3k at 0.33: the lightest press that seats, below CS-1's PRESS pulled up, ~990 driven)
+//!   and stays there; Action::Pressure presses a held key to another velocity's force over 20 ms;
+//!   a release lifts it in 8 ms. A count of noise. The digital scan still sees the key as
+//!   pressed from Action::Key to its release. A row that is neither pulled up nor driven reads
+//!   adc_value as before.
 
 use std::collections::VecDeque;
+
+/// `Periph::adc_state`: CON, done, IRQ, the sample, the noise generator
+pub(crate) type AdcState = (u32, bool, bool, u16, u32);
 
 pub const CPU_HZ: u64 = 240_000_000;
 /// TIMER4 counts the 24 MHz crystal; TIMER5 runs from OSC/4.
@@ -214,6 +230,16 @@ pub struct Periph {
     led_last: u64,
     led_since: u64,
     pub keys_down: [bool; 41],
+    /// The keys' force (the module notes): a ramp from `from` to `to` over `dur` cycles from `t0`
+    key_force: [Ramp; 41],
+    /// FM-1: the velocity of the next presses (Action::KeyVel; 1..127)
+    pub key_vel: u8,
+    /// Port A's direction (1 = input), pull-ups and drive strength, for the rows' readings
+    pa_dir: u32,
+    pa_pu: u32,
+    pa_hd0: u32,
+    pa_hd: u32,
+    adc_noise: u32,
     enc_state: [u8; 8],
     enc_pending: [i32; 8],
     enc_next: [u64; 8],
@@ -239,6 +265,44 @@ pub enum Action {
     Midi { b: u8 },
     /// SMK-37: the next keys' velocity, as microseconds between their two contacts.
     Vel { us: u32 },
+    /// FM-1: the next keys' velocity (1..127): how hard they land on their pills.
+    KeyVel { vel: u8 },
+    /// FM-1: a held key pressed to the force of velocity `vel` (aftertouch; 1..127).
+    Pressure { id: u8, vel: u8 },
+}
+
+/// A key's force: from `from` to `to` (0..1) over `dur` cycles from cycle `t0`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ramp {
+    from: f32,
+    to: f32,
+    t0: u64,
+    dur: u64,
+}
+
+impl Ramp {
+    fn at(&self, t: u64) -> f32 {
+        if self.dur == 0 || t >= self.t0 + self.dur {
+            return self.to;
+        }
+        let x = t.saturating_sub(self.t0) as f32 / self.dur as f32;
+        self.from + (self.to - self.from) * x
+    }
+}
+
+/// The force a key lands at for velocity `vel` (1..127)
+fn vel_force(vel: u8) -> f32 {
+    0.33 + 0.67 * vel.clamp(1, 127) as f32 / 127.0
+}
+
+/// The ADC reading of a row with a key of force `f` on it (0: open, buttons 1) against the
+/// source resistance `rs` (the pull-up or the pin driver), in counts
+fn pill_reading(f: f32, rs: f32) -> f32 {
+    if f <= 0.001 {
+        return 1023.0;
+    }
+    let r = 100.0 * f.min(1.0).powf(-3.06);
+    186.0 + 837.0 * r / (r + rs)
 }
 
 impl Default for Periph {
@@ -301,6 +365,13 @@ impl Default for Periph {
             led_last: 0,
             led_since: 0,
             keys_down: [false; 41],
+            key_force: [Ramp::default(); 41],
+            key_vel: 100,
+            pa_dir: 0,
+            pa_pu: 0,
+            pa_hd0: 0,
+            pa_hd: 0,
+            adc_noise: 1,
             enc_state: [0; 8],
             enc_pending: [0; 8],
             enc_next: [0; 8],
@@ -487,7 +558,19 @@ impl Periph {
                 if self.board == crate::Board::Smk37 {
                     self.smk.key(id, down, self.cycles, self.smk_vel);
                 } else if (id as usize) < 41 {
-                    self.keys_down[id as usize] = down;
+                    let (i, t) = (id as usize, self.cycles);
+                    if self.keys_down[i] != down {
+                        let (to, ms) = if down { (if id < 14 { 1.0 } else { vel_force(self.key_vel) }, 1.5) } else { (0.0, 8.0) };
+                        self.key_force[i] = Ramp { from: self.key_force[i].at(t), to, t0: t, dur: self.ms_cycles(ms) };
+                    }
+                    self.keys_down[i] = down;
+                }
+            }
+            Action::KeyVel { vel } => self.key_vel = vel.clamp(1, 127),
+            Action::Pressure { id, vel } => {
+                let (i, t) = (id as usize, self.cycles);
+                if i < 41 && self.keys_down[i] && id >= 14 {
+                    self.key_force[i] = Ramp { from: self.key_force[i].at(t), to: vel_force(vel), t0: t, dur: self.ms_cycles(20.0) };
                 }
             }
             Action::Enc { enc, clicks } => {
@@ -564,6 +647,18 @@ impl Periph {
     /// MIDI bytes dropped (no receiver set up: the UART off or no DMA ring; or a full queue).
     pub fn midi_dropped(&self) -> u64 {
         self.uart.dropped
+    }
+
+    /// The SARADC's state as a polling loop can change it (`machine`'s loop skip): CON, done,
+    /// the IRQ line, and what a conversion start sets: the sample (a row's key force, which
+    /// ramps) and the noise generator (it moves on every row conversion, so rounds that convert
+    /// a row never repeat, and a failed probe's undo puts it back).
+    pub(crate) fn adc_state(&self) -> AdcState {
+        (self.adc_con, self.adc_done, self.adc_irq, self.adc_sample, self.adc_noise)
+    }
+
+    pub(crate) fn set_adc_state(&mut self, (con, done, irq, sample, noise): AdcState) {
+        (self.adc_con, self.adc_done, self.adc_irq, self.adc_sample, self.adc_noise) = (con, done, irq, sample, noise);
     }
 
     /// One cycle; true when something timed is due (call `advance(0)`).
@@ -717,8 +812,8 @@ impl Periph {
             // (Felucca's `|= 0x40` read-modify-write must keep it); the stock scan's "skip
             // while bit 4" passes because its IRQ 24 handler writes CON = 0x40, then 0.
             0x13100 => (self.adc_con & !0x80) | if self.adc_done { 0x80 } else { 0 },
-            0x13104 if self.board == crate::Board::Smk37 => self.adc_sample as u32,
-            0x13104 => self.adc_value[((self.adc_con >> 8) & 0xf) as usize] as u32,
+            // RES: the conversion's value, taken when it started (the FM-1's rows: their key then)
+            0x13104 => self.adc_sample as u32,
             // the latch's set word reads the pending bits; its clear word reads 0: the stock
             // IRQ 122 handler acknowledges with `[0x1EEF1A4] |= 4`, and a read-back of every
             // pending bit there cleared a pending context switch too (a task ran on after
@@ -761,7 +856,14 @@ impl Periph {
         // next instruction (leaving compiled code). Not for the FM-1's ADC: its conversions are
         // instant, so a write there changes only whether IRQ 24 is raised (then it does).
         // OberVave converts ~1 M times a second, 5 writes each: every one left the JIT.
-        if !(matches!(addr, 0x13100 | 0x13104) && self.board != crate::Board::Smk37) {
+        // Nor for the port pins (the key matrix's shift registers, the LED lines: nothing timed;
+        // Felucca and its forks scan the matrix with ~0.5 M writes a second) but PD0, the flash
+        // chip select, nor for the counters' words that ignore writes (the stock firmware's core
+        // 1 writes TIMER5's ~1.3 M times a second).
+        let untimed = matches!(addr, 0x13100 | 0x13104) && self.board != crate::Board::Smk37
+            || matches!(addr, 0x50000..=0x501ff) && addr != 0x500c0
+            || matches!(addr, 0x10808 | 0x10904);
+        if !untimed {
             self.next_due = 0;
         }
         match addr {
@@ -836,6 +938,8 @@ impl Periph {
                             self.adc_next = self.cycles + (self.hz / 25_000).max(1);
                             self.next_due = 0;
                         } else {
+                            let ch = (v >> 8) & 0xf;
+                            self.adc_sample = self.row_reading(ch).unwrap_or(self.adc_value[ch as usize]);
                             self.adc_done = true;
                             if self.adc_irq != (v & 0x20 != 0) {
                                 self.next_due = 0;
@@ -920,6 +1024,23 @@ impl Periph {
             0x50000 => {
                 self.led_credit();
                 self.pa_write(v);
+            }
+            // (also kept as plain SFRs: the rows' readings need them)
+            0x50008 => {
+                self.pa_dir = v;
+                return false;
+            }
+            0x50010 => {
+                self.pa_pu = v;
+                return false;
+            }
+            0x50018 => {
+                self.pa_hd0 = v;
+                return false;
+            }
+            0x5001c => {
+                self.pa_hd = v;
+                return false;
             }
             0x501c0 => {
                 self.led_credit();
@@ -1036,6 +1157,39 @@ impl Periph {
             // RCLK rising edge: outputs follow the shift register
             self.sr_latched = self.sr_shift;
         }
+    }
+
+    fn ms_cycles(&self, ms: f64) -> u64 {
+        (self.hz as f64 * ms / 1000.0) as u64
+    }
+
+    /// ADC channel 0 / 1 (row PA7 / PA8): the key in the latched column, through the row's
+    /// pull-up or its driver (the module notes). None: not a row, or a row neither pulled up nor
+    /// driven (the channel's adc_value then, as before).
+    fn row_reading(&mut self, ch: u32) -> Option<u16> {
+        let (row, pin) = match ch { 0 => (3usize, 7u32), 1 => (4usize, 8u32), _ => return None };
+        let m = 1u32 << pin;
+        let rs = if self.pa_dir & m == 0 {
+            if self.pa_out & m == 0 {
+                return Some(0);
+            }
+            [312.0, 132.0, 51.0, 35.0][((self.pa_hd0 & m != 0) as usize) | ((self.pa_hd & m != 0) as usize) << 1]
+        } else if self.pa_pu & m != 0 {
+            10_000.0
+        } else {
+            return None;
+        };
+        let t = self.cycles;
+        let mut v = 1023.0f32;
+        for col in 0..11usize {
+            let id = KEYMAP[row][col];
+            if self.sr_latched & (1 << col) == 0 && id >= 0 {
+                v = v.min(pill_reading(self.key_force[id as usize].at(t), rs));
+            }
+        }
+        self.adc_noise = self.adc_noise.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        let n = ((self.adc_noise >> 16) % 3) as f32 - 1.0;
+        Some((v + if v < 1023.0 { n } else { 0.0 }).round().clamp(0.0, 1023.0) as u16)
     }
 
     /// Row bits (0..5) pulled low by a closed contact in a selected column.
@@ -1158,6 +1312,51 @@ fn note_name(n: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One conversion on ADC channel `ch`, as hal/fm1_adc.h starts and takes it.
+    fn convert(p: &mut Periph, ch: u32) -> u32 {
+        p.write(0x13100, 0x40 | ch << 8 | 0x0e);
+        p.write(0x13100, 0x40 | 0x10 | ch << 8 | 0x0e);
+        p.read(0x13104).unwrap()
+    }
+
+    #[test]
+    fn the_rows_read_a_keys_pill() {
+        let mut p = Periph::default();
+        let ms = p.hz / 1000;
+        // row PA7 an input with its pull-up, column 0 latched: key 9 (id 23)
+        p.write(0x50008, 1 << 7);
+        p.write(0x50010, 1 << 7);
+        p.sr_latched = !1;
+        assert_eq!(convert(&mut p, 0), 1023, "open");
+        p.apply(&Action::KeyVel { vel: 127 });
+        p.apply(&Action::Key { id: 23, down: true });
+        p.cycles += 2 * ms;
+        assert!((193..=196).contains(&convert(&mut p, 0)), "firmly pressed, pulled up: the diode and a little");
+        // driven high at the strongest (HD0 + HD): ~806 firm
+        p.write(0x50008, 0);
+        p.pa_out |= 1 << 7;
+        p.write(0x50018, 1 << 7);
+        p.write(0x5001c, 1 << 7);
+        let firm = convert(&mut p, 0);
+        assert!((804..=808).contains(&firm), "{firm}");
+        p.apply(&Action::Key { id: 23, down: false });
+        p.cycles += 10 * ms;
+        assert_eq!(convert(&mut p, 0), 1023, "lifted");
+        p.apply(&Action::KeyVel { vel: 1 });
+        p.apply(&Action::Key { id: 23, down: true });
+        p.cycles += 2 * ms;
+        let light = convert(&mut p, 0);
+        assert!((1004..=1012).contains(&light), "a light press reads higher: {light}");
+        p.apply(&Action::Pressure { id: 23, vel: 127 });
+        p.cycles += 25 * ms;
+        assert!(convert(&mut p, 0) < 810, "pressed harder");
+        p.sr_latched = !2;
+        assert_eq!(convert(&mut p, 0), 1023, "another column: its key is open");
+        p.pa_out &= !(1 << 7);
+        assert_eq!(convert(&mut p, 0), 0, "driven low");
+        assert_eq!(convert(&mut p, 4), 900, "the MASTER pot as before");
+    }
 
     /// Advance to `cycle`, collecting the bytes the UART's DMA wrote.
     fn run_to(p: &mut Periph, cycle: u64, got: &mut Vec<(u32, u8)>) {

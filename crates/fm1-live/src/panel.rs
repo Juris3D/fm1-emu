@@ -81,6 +81,13 @@ pub fn keys() -> Vec<(u8, usize, usize, usize, usize, bool)> {
     v
 }
 
+/// The velocity of a click on key `id` at height `y`: 1 at its top, 127 at its bottom.
+pub fn key_vel(id: u8, y: f32) -> u8 {
+    keys().iter().find(|k| k.0 == id).map_or(100, |&(_, _, py, _, h, _)| {
+        (1.0 + 126.0 * ((y - py as f32) / h as f32).clamp(0.0, 1.0)).round() as u8
+    })
+}
+
 pub fn hit(x: f32, y: f32) -> Option<Ctl> {
     for (i, (_, _, cx, cy, r)) in ENCS.iter().enumerate() {
         if (x - cx).powi(2) + (y - cy).powi(2) <= (r + 6.0).powi(2) {

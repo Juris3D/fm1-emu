@@ -824,6 +824,253 @@ budget now ends), the same levels (peaks within 2 counts); speed geomean -1.3% J
 interpreted (noise). This also unblocks changes that move block boundaries (5.27's review: the
 polling-loop skip without its 4096 cap, untimed peripheral writes).
 
+## 5.29 The browser's audio schedule, its speed readout and its clock advice (2026-10-22)
+
+From 5.27's browser review and issue #21. Half the catalog hands out audio in 256- or 512-frame DMA
+half buffers, and `fm1_render` ran the machine only when the queue was short of a quantum's 128
+frames: every second or fourth quantum emulated 5.8 or 11.6 ms at once and the others nothing, so a
+device needed 2-4x real time not to drop out. `fm1_ahead` (fm1-web's `Pace`) makes each quantum
+also run its share of emulated time (the credit carried over, so the pace is the audio clock's)
+while the queue holds less than one half buffer beyond the quantum. Time that a short queue forced
+is not owed back, so the pace moves ahead of the half buffers until they come before they are
+needed. Half buffers no larger than a quantum (Felucca, the stock firmware) run as before. The same
+20k chunks run in the same order, so the audio is the same: all 98 packages byte for byte over the
+common length. Cost: input lands up to one half buffer later (X0X mean 7.3 ms, max 11.6; FM1GM max
+5.8 ms; Felucca and stock 0). In Node at 240 MHz, steady quanta over 2.9 ms: X0X 421 -> 21 (playing
+a pattern 420 -> 74), FM1GM 145 -> 2, FOMAJAM 836 -> 7, CS-1 840 -> 145, Tonitor 140 -> 4; all 98:
+14109 -> 3027, with the speed unchanged (geomean 2.32x). What remains on X0X and CS-1 is their own
+uneven work per emulated millisecond (X0X's slow quanta cost twice its mean), not the schedule.
+
+The worklet's budget was 20 ms of emulated time per quantum throughout. Now that holds while a
+firmware boots (Tonitor boots 3.8 s silent), and once audio plays it is 1.5 quanta (with the pace
+on), so a stalled firmware no longer holds the audio thread ~7 quanta' worth at a time.
+`?ahead=0` turns the pace off and keeps the 20 ms. The 1.5 quanta suffice only when the pace may
+run a whole half buffer ahead: with less (`?ahead=256` on X0X's 512-frame halves, or halves larger
+than the default 1024), the quantum that empties the queue must also run the rest of the half
+buffer, and X0X dropped every fourth quantum (458 in 6 s at 240 MHz). `fm1_render` raises the cap
+by that rest (`Pace::least`); `simulate` checks no quantum is short for halves of 128-2048 frames.
+
+The status line's "M instructions/s" was cpu0's run budget in 20k chunks. It is now the speed:
+emulated time per time spent emulating, as `bench.mjs` and `fm1-live --bench` print it. The copied
+report gives it per second, the idle-skipped share (`fm1_idle_ms`), the JIT's regions, failures and
+compile time, and a worst quantum that leaves out boot quanta. The warning's advice to lower the
+clock assumed the cost scales with it. The stock firmware idles 43/69/83% of the time at 60/120/240
+MHz, idle skipping removes that, and it runs at 2.62x real time at 60 MHz and 2.39x at 240. Felucca
+runs at 4.96x and 2.01x, X0X at 4.17x and 1.74x, CS-1 at 2.96x and 1.32x: about a quarter fixed
+cost plus the cycles run. The warning now estimates the load at a lower clock from the measured idle
+share. It offers a lower clock only where that brings the load down, and otherwise says why it
+would not help. It also says to close the developer tools (with a debugger attached the wasm runs
+3-4x slower). Left open: a work-based lead (running further ahead in cheap quanta) would absorb X0X's
+own spikes at the cost of more latency; moving the emulation to a Worker (P-core placement on
+hybrid CPUs) is 5.27's estimate, not tried.
+
+## 5.30 Micro-ops for what still went through the executor or step; pairs that run second first (2026-10-22)
+
+From the interpreter and JIT reviews of 5.27, the items that need no new generated code in either
+native backend (the generated-code ones — returns through a pc table, compiled swapped pairs, the
+RAM guard's version compared inline, predicated prefixes — follow on top):
+
+- `call R` / `goto R` are micro-ops (`Fast::CallR`, `Fast::GotoR`; compiled code calls the
+  executor for them). Blocks no longer end at them. Few are left on core 0 now (Melodee about
+  60 K a second), so the gain is small; with 5.28's budgets it moves no audio.
+- Routes 18 / 19, loads and stores with an increment, are the micro-ops every backend compiles
+  inline: `LdPost` / `StPost`, `Ld` / `St` for a word at an offset (`inc_mem_fast`). A load into
+  its own base register and the pre-increments stay raw (exec_raw's rule differs there). JIT:
+  Grimm 2.8x -> 5.6x, FM-106 +70%, OberVave +34%, and a dozen catalog firmwares +80-165%.
+- RAM blocks are checked by the bus's code-write count natively too (was the wasm build's only;
+  the native JIT's RAM guards already relied on it): every write that can reach a block's bytes is
+  counted, compiled code's inline stores included. Melodee interpreted +12%.
+- `Fast::Swap`: a dual-issue pair whose second instruction reads what a register-only head writes
+  (so it cannot be glued), where the head reads and writes nothing the second writes and not both
+  set the flags, is one op of two instructions that runs the second first, then the head — the
+  pair rule's result. `run_fast` runs it whole when nothing is in progress, both fit the budget and
+  the second one's tick is not due; else as the two careful steps. Careful: compiled code still
+  stops before it (the follow-up can compile it). Plain ops in an if-else then-part apply
+  `finish`'s skip rule without the general careful path. FM1-DOOM +15% JIT, +10% interpreted.
+- `cli` and `R = icfg`: compiled code calls a quiet helper (CPU state only: no tick sync, nothing
+  due after) with the same arguments as `h_op`; icfg is read without a string match. GhoulBox +5%.
+
+Exactness: all 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, 8 s with
+keys: byte-identical to master, and JIT == interpreter on every one. The browser build gives
+master's audio on Felucca, FM1-DOOM, Melodee and the stock firmware, JIT and not. New tests: route
+18 / 19 micro-ops against exec_raw's arm (20000 random encodings), swapped pairs against the pair
+rule (random heads and second instructions: registers, flags, sp, rets, pc, memory), a real pair
+in a block cut by the budget, and the JIT random-state test with call R, goto R, cli, sti and both
+icfg moves (interrupt state compared). Speed (this Mac, loaded; one run per firmware): JIT
+geomean +16%, interpreted +4%.
+
+## 5.31 Polling loops skipped to the cycle (2026-10-22)
+
+The rest of 5.27's SoC review, now that budgets hold to the instruction (5.28). FM1-DOOM, ZP-12,
+OberVave, Etch, Beetle and fmini spend much of their time in a main loop with nothing to do: a
+watchdog kick through the P33 port and a look at flags their interrupts set, round after round
+until the next interrupt. Such a round leaves the machine as it found it, and until the next
+timed event nothing it reads can change, so every round runs the same. `machine::probe_loop`
+runs cpu0 on in the interpreter through `ProbeBus` (at a block boundary, outside interrupts,
+with nothing pending, room before the next event and enough budget left). Loads must only look
+(`Soc::pure_read`, region by region from `read32_slow`: no clock, no counter, no log); stores go
+to RAM (logged with the word they replace; not into code words) or to the P33 port and the FM-1's
+instant ADC, whose state is compared. Back at the pc it began at with the same core
+(`Cpu::plain_state`), the same port and ADC, and every RAM word the round stored to as it was when
+the round began, the rounds whose ticks all fall before `next_due`, and within the budget, are
+added as k * L cycles: the machine as running them would leave it, at the same cycle. A probe
+that finds nothing (an impure access, refused rather than made; an event; 2048 steps without a
+round) undoes all it ran, core, RAM, port, ADC and clock, so the run goes on exactly as without
+it. Probes run a step at a time, so they back off after one that failed and spend a credit (one
+per step, earned back at 1/16 of a skipped instruction with the JIT, 1/4 interpreted, and
+1/2048 a cycle): without it Ctl and Polly, whose ~640-instruction rounds alternate with real
+work, ran 10% slower with the JIT. `FM1_NO_LOOPSKIP` turns it off (A/B; FM1_TRACE does too).
+
+Two smaller ones with it. Port-pin writes (but PD0, the flash chip select) and the counters'
+write-ignored words (0x10808, 0x10904) no longer force a service: nothing timed hangs on them,
+and Felucca's matrix scan wrote the port half a million times a second (+9%). And cpu0 alone
+runs in one stretch instead of 4096-instruction ones (a skip was cut at 4096): the block loop
+stops at the release of cpu1 and says how far it got, and the rest of the 4096-chunk the
+release fell in is still not run, so cpu1 starts where it did. (That forfeit is master's
+accounting kept for the same output; dropping it would move every dual-core firmware's timeline
+by up to 4095 instructions, once.) No probe while a release is latched (`Soc::cpu1_release`):
+the block loop then breaks after every `run_fast` return, and a skip would carry cpu0 past where
+it stops without one. Master latches it again on any later 0 -> 1 of 0x10008 bit 3, with cpu1
+already running, and nothing takes it (cpu0 then runs one instruction a slice); no firmware
+tested does that, and the latch is for a change of its own.
+
+All 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, --bench 8000 with
+keys: the same audio as before, byte for byte, JIT = interpreter, also with FM1_NO_LOOPSKIP;
+cpu1's instruction counts unchanged. Unit tests drive a key-polling loop against the same
+machine without the skip, a skip one cycle late fails them. Speed, best of 3 against master on a
+shared machine (JIT / interpreted): FM1-DOOM 2.21 -> 5.26x / 1.34 -> 2.94x (a 3 s run, its menu
+only: ~20x), ZP-12 3.42 -> 7.68x / 1.28 -> 2.01x, OberVave 2.87 -> 4.35x / 1.28 -> 1.59x, Felucca
+4.92 -> 5.34x, stock +3%, Grimm, Melodee, Jiant +4-5% (JIT); over all 84 a geomean of +12.5%
+JIT, +11.6% interpreted, none below 0.98x. The dual-core firmwares (stock, Open, X0X, Jiant, ...)
+skip nothing: within cpu0's 1024-instruction slices their probes find no round worth it.
+
+## 5.32 Generated code that stays in generated code: returns through a pc table, swapped pairs, RAM guards inline, then-parts (2026-10-23)
+
+The generated-code items of 5.27's JIT review, on top of 5.30, in both native backends (AArch64
+and x86-64, op for op):
+
+- Returns and computed jumps (rts, `call R`, `goto R`, a pop into pc, a table jump, a jump
+  through the executor) look their target up in a direct-mapped table of compiled bodies
+  (`Jit::itab`, 16 K entries by pc >> 1) and jump straight in, instead of always leaving for
+  Rust. The body checks what a chain target checks (its whole prefix fits the call's limit, its
+  RAM snapshot); after a bus access brk is checked first. `call R` / `goto R` are compiled
+  inline. A pop with pc in its mask that falls through the executor now checks brk before it
+  chains on. FM1-DOOM +15%, Felucca +19%.
+  - A body goes in when it compiles, and again when an exit to it comes back to Rust after a
+    later body on the same entry took its place (markterm's #47 fills its dynamic-jump table
+    that way, `set_dyn`). Without the refill an evicted hot return target stayed out for good:
+    58% of GhoulBox's entries from Rust, 35% of Felucca's. GhoulBox +7-12%, Felucca +4-6%.
+  - An empty entry's tag is the pc of another entry (`(i ^ 1) << 1`), so no target matches it.
+    It was all ones, and a computed jump to 0xffff_ffff (an erased-flash function pointer, a
+    trashed rets) branched the host to address 0 (SIGSEGV) where the interpreter goes on.
+- `Fast::Swap` compiled: the second instruction (both ticks taken), then the head, then one
+  check. After the pair the careful path stops for a pending interrupt; compiled code does too
+  (`h_pair`, called only when brk is set or `Ctx::irq` is not known to be clear: helpers mark it
+  unknown, since only the bus changes it; asking the bus in every helper cost ZP-12 10%).
+  FM1-DOOM +18%.
+- RAM bodies compare the bus's code-write count (`Ctx::ver`, `RamGuard::ver`) inline and call
+  `h_ram_ok` only when it changed: a code write sets brk, so the count cannot change while
+  compiled code runs. Melodee +23%.
+- Compiled prefixes inside an if-else then-part or a rep loop (one of the two in progress,
+  nothing else), when no instruction but the last can end it: then-part ends at or past the
+  prefix's end, the rep end not in it or at its end. Capped at that prefix; run_fast applies
+  `finish`'s rule for the last instruction and the careful path's stop; the chain slot is
+  linked before the skip. Pairs inside: no stop after a swapped pair there (`Ctx::inside`), no
+  glued head that may use the bus. GhoulBox +27%.
+- If-else blocks compiled with their then-part (plain ops), as the wasm JIT does: not taken, on
+  at the else part; taken, the then-part and past the else part, stopping for a pending
+  interrupt there; an exit inside the then-part leaves the skip for `pred_skips` (`Ctx::pred`).
+  Inside another construct the ops before the if run instead (a second compiled variant).
+  FM1-DOOM +21%, ZP-12 +16%.
+- markterm's #46: the rest of routes 18 / 19 / 32 (loads and stores that update their base) as
+  micro-ops: route 18's pre-increments as `LdPre` / `StPre`, route 32 as `LdPre` / `StPre` /
+  `LdPostR` / `StPostR` (raw: a high-half store, an access of the base register itself), with
+  inline lowerings in both native backends (the wasm JIT reaches them through `h_op`, as it did
+  the raw route). 5.30's rule stays: a post-increment load into its own base is raw. The random
+  test against exec_raw's arm now covers all three routes and requires each form to come up.
+  Melodee and Felucca about +2%.
+
+Exactness: all 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, 8 s with
+keys: byte-identical to master before 5.30, and JIT == interpreter on all 84, with every change
+above; after the rebase onto 5.31, FM1-DOOM, ZP-12, Felucca, Melodee, GhoulBox and the stock one
+again. x86-64: the fm1-core / fm1-soc / fm1-isa tests in an amd64 Linux container (the encoder
+test with the new encodings checked against llvm-mc), and before the refill and #46 an audio
+comparison under qemu-x86_64 on twelve firmwares (x86 JIT == x86 interpreter == AArch64);
+`cargo check` for wasm32.
+New tests: the table (rts, goto R, call R, a pop: into the body, not past the limit, nothing
+there, a due tick, changed code, a jump to all ones, an evicted body listed again), compiled
+swapped pairs against the pair rule, run_fast differential tests with a clock and interrupts
+(swapped pairs; prefixes inside then-parts and rep loops), the inline RAM guard, if-else blocks
+against the careful path, routes 18 / 19 / 32 against the raw arm; each fails with the rule it
+checks removed. Speed (this Mac, shared with other benchmarks): the whole catalog, one
+interleaved run each, against master before 5.30: JIT geomean +36% (5.30 and this together),
+interpreted +5%. Against master with 5.31, best of 2 (JIT / interpreted): FM1-DOOM 6.19 -> 9.20x
+/ 2.97 -> 2.98x, GhoulBox 3.58 -> 5.71x / 1.35 -> 1.39x, Felucca 5.52 -> 7.55x / 1.40 -> 1.42x,
+Melodee 4.23 -> 5.76x / 1.43 -> 1.32x, ZP-12 8.72 -> 10.23x / 1.95 -> 2.00x, stock 6.42 -> 7.25x
+/ 4.44 -> 4.49x. Melodee interpreted moves between 1.23x and 1.46x from one commit of this
+branch to the next (it is at master's speed on some), a code layout effect in run_fast.
+
+## 5.33 markterm's core 1 stretches, guest registers in host registers, and more ops compiled (2026-10-23)
+
+Three PRs from markterm (Mark White), #48, #49 and #50, ported onto 5.32 with his authorship kept:
+
+- #48, core 1's idle probe in stretches. While `run_cpu1` probes core 1's polling loop it makes
+  one `run_fast` call per block and decides between them. With nothing pending for core 1 those
+  calls now run back to back in one (`Cpu::stop_pc`). That call returns only where one of them
+  ends and the loop could decide otherwise: back at the probe's pc, after anything that may have
+  touched a peripheral (compiled code's helpers set `stop_io`; interpreted code counts too), or
+  with the probe's or the slice's count spent. Compiled code runs on from block to block only
+  through blocks compiled whole and checks those points at each body's entry. A block left
+  inside (a code write) says how much of it was left (`stop_rest`). Same calls, same points.
+- #49 (AArch64): guest registers kept in eight caller-saved host registers within a block.
+  `ld_reg` loads at first use and `st_reg` marks the register changed; exits, chains and helper
+  calls write the changed ones back, and a call reloads them after. There is a 3000-block random
+  test against the interpreter.
+- #50 (AArch64): register-pair loads and stores without a base update (`LdPair` / `StPair`,
+  route 16), route 41's min / max as `MinMax`, `Un`, `Div` and `cli` compiled inline. A
+  dual-issue pair's head of route 16 or 41 stays raw: glued to the next instruction it moved
+  interrupts in Skiff and NMSFM.
+
+Porting, beyond conflict resolution (itab for his dyn_tab, emit_op, Prefix, ind_brk flushing for
+#49, the flag lists for #50's new ops), #48 needed four changes on this base (their own commit):
+- calls counted in instructions, a swapped pair being two, with a stop at its second running the
+  head alone, as `block_len_to` does;
+- the stretch's room raised from 32 to 64 instructions (`STRETCH_ROOM`, a block's most with
+  swapped pairs);
+- a prefix with an if-else then-part in tow is not "whole";
+- `check_pair`'s exit after a compiled swapped pair stores `stop_rest`.
+
+The stretch's bookkeeping in run_fast's loop cost every interpreted run (Melodee -15%, Felucca
+-6%, stock -4%). run_fast is now generic over STRETCH: the normal copy has none of it, and
+`run_stretch` (not inlined) runs the other copy only while `stop_pc` is set.
+
+Exactness:
+- All 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, 8 s with keys:
+  byte-identical to master (db8d472), and JIT == interpreter on all 84.
+- With the stretch on and off (`stop_checks`) on stock, FM1 Open and MC-1: identical.
+- The fm1-core / fm1-soc / fm1-isa tests pass at each commit on AArch64 and x86-64 (amd64
+  container), and `cargo check` passes for wasm32.
+
+Speed against 5.32 (this Mac, shared, best of 3 interleaved; JIT / interpreted):
+
+| Firmware | JIT before | JIT after | Interp. before | Interp. after |
+|---|---|---|---|---|
+| MC-1 | 3.11x | 3.50x | 1.08x | 1.06x |
+| GhoulBox | 5.67x | 6.13x | 1.39x | 1.39x |
+| OberVave | 8.80x | 9.31x | 1.72x | 1.80x |
+| FM1-DOOM | 9.17x | 9.42x | 3.00x | 3.10x |
+| Felucca | 7.53x | 7.72x | 1.43x | 1.42x |
+| Melodee | 5.86x | 5.99x | 1.31x | 1.39x |
+
+- Stock, FM1 Open, ZP-12, Grimm and X0X are within ±2%.
+- Geomean over the 11: JIT +3.1%, interpreted +1.1%.
+- The stretch alone, on and off in the same build (JIT): MC-1 +12%, stock +5%, FM1 Open +3.5%.
+- The #48 measurement that showed FM1 Open +7% was against master, before 5.30-5.32; here
+  FM1 Open gains nothing net against 5.32.
+- On this Mac (Apple cores forward stores cheaply), #49's register cache is about neutral.
+- Melodee's core 1 never starts in fm1-live's 8 s bench, so #48's Melodee gain (measured on a
+  Pixel 7 Pro in Harbor) does not show here.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

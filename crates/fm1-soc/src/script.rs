@@ -24,6 +24,12 @@ pub fn queue(soc: &mut Soc, keys: &str) {
                 }
                 continue;
             }
+            // `ms:ID@VEL` presses at velocity VEL (1..127; FM-1: how hard it lands on its pill),
+            // `ms:ID~VEL` presses a held key to VEL's force (aftertouch)
+            let (rest, vel, pressure) = match rest.trim().split_once(['@', '~']) {
+                Some((i, v)) => (i, v.parse::<u8>().ok(), rest.contains('~')),
+                None => (rest, None, false),
+            };
             let id = rest;
             let (id, down) = match id.trim().strip_suffix('^') { Some(i) => (i, false), None => (id.trim(), true) };
             // a number, or a name on this board's panel (FM-1: `PLAY`, `C4`; SMK-37: `seqplay`, `k12`)
@@ -33,7 +39,14 @@ pub fn queue(soc: &mut Soc, keys: &str) {
             });
             if let (Ok(t), Some(id)) = (t.trim().parse::<u64>(), id) {
                 let at = soc.periph.cycle_of_ms(t);
-                soc.periph.script.push_back((at, Action::Key { id, down }));
+                match (vel, pressure) {
+                    (Some(vel), true) => soc.periph.script.push_back((at, Action::Pressure { id, vel })),
+                    (Some(vel), false) => {
+                        soc.periph.script.push_back((at, Action::KeyVel { vel }));
+                        soc.periph.script.push_back((at, Action::Key { id, down }));
+                    }
+                    _ => soc.periph.script.push_back((at, Action::Key { id, down })),
+                }
             }
         }
     }
@@ -53,5 +66,14 @@ mod tests {
             Action::Midi { b: 0x3c }, Action::Midi { b: 0x64 },
             Action::Key { id: 21, down: false }]);
         assert_eq!(soc.periph.script.back().unwrap().0, soc.periph.cycle_of_ms(100));
+    }
+
+    #[test]
+    fn velocity_and_pressure() {
+        let mut soc = Soc::new(1 << 20, vec![]);
+        queue(&mut soc, "0:21@40,10:21~120,20:21^");
+        let actions: Vec<_> = soc.periph.script.iter().map(|(_, a)| a.clone()).collect();
+        assert_eq!(actions, vec![Action::KeyVel { vel: 40 }, Action::Key { id: 21, down: true },
+            Action::Pressure { id: 21, vel: 120 }, Action::Key { id: 21, down: false }]);
     }
 }
