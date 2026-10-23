@@ -52,8 +52,9 @@ windows\Start.cmd                                                             th
 ```
 
 GitHub builds the same zip on every push (`.github/workflows/windows.yml`: Actions → Windows →
-the run → Artifacts), tests one firmware on each board, and publishes a Release for a tag
-`win-v…` (e.g. `git tag win-v0.2.0-1 && git push --tags`).
+the run → Artifacts) and tests one firmware on each board. A push to the branch `release`
+publishes the shareable zip (the app, README.txt, LICENSE.txt) as the GitHub Release
+`win-v<version of crates/fm1-desk>`: raise that version, then `git push origin windows:release`.
 
 ## The rule: both boards, always
 
