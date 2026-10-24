@@ -359,12 +359,50 @@ pub fn fetch_package(e: &Entry) -> Result<(Vec<u8>, Option<String>), String> {
             }
         }
     }
-    for n in names {
+    // An installer page may name many firmwares (one author's site lists all of theirs): when
+    // the listed package has gone (replaced by a newer version), take that firmware's newer
+    // files, same variant, the newest first, not whichever the page names first.
+    let tried: Vec<(String, Option<String>)> = match e.package.as_deref().and_then(stem_variant) {
+        Some((stem, variant)) => successors(&names, &stem, &variant),
+        None => names.into_iter().map(|n| (n, None)).collect(),
+    };
+    for (n, version) in tried {
         if let Ok(b) = join(&base, &n).and_then(|u| get_bytes(&u)) {
-            return Ok((b, None));
+            if crate::engine::board_of(&b).is_ok() {
+                return Ok((b, version));
+            }
         }
     }
     Err(format!("{last_err}, and {inst} names no package that loads"))
+}
+
+/// The model variants a package's name can end in (SMK-37 Elite, MKE-P37, an FM-1 build).
+const VARIANTS: [&str; 3] = ["-elite", "-mke", "-fm1"];
+
+/// "…/makkuro37-0.1-mke.fwsc" -> ("makkuro37", "-mke"): the name before its version, and its variant.
+fn stem_variant(url: &str) -> Option<(String, String)> {
+    let file = url.rsplit('/').next()?.strip_suffix(".fwsc")?;
+    let variant = VARIANTS.iter().find(|v| file.ends_with(*v)).map_or("", |v| *v);
+    let file = &file[..file.len() - variant.len()];
+    // the version starts at the first "-<digit>"
+    let at = file.char_indices().find(|&(i, c)| c == '-' && file[i + 1..].starts_with(|d: char| d.is_ascii_digit()))?.0;
+    Some((file[..at].to_string(), variant.to_string()))
+}
+
+/// The names in `names` of firmware `stem` in `variant`, with their versions, the newest first.
+fn successors(names: &[String], stem: &str, variant: &str) -> Vec<(String, Option<String>)> {
+    let mut v: Vec<(String, Option<String>)> = names
+        .iter()
+        .filter_map(|n| {
+            let file = n.rsplit('/').next()?.strip_suffix(".fwsc")?;
+            let (s, var) = stem_variant(&format!("{file}.fwsc"))?;
+            (s == stem && var == variant).then(|| (n.clone(), Some(file[s.len() + 1..file.len() - var.len()].to_string())))
+        })
+        .collect();
+    v.dedup();
+    let key = |ver: &Option<String>| -> Vec<u64> { ver.as_deref().unwrap_or("").split(|c: char| !c.is_ascii_digit()).filter_map(|x| x.parse().ok()).collect() };
+    v.sort_by(|a, b| key(&b.1).cmp(&key(&a.1)));
+    v
 }
 
 /// The `[\w./-]+\.fwsc` names in a page, M-VAVE's own FM-1.fwsc left out (fwsc.js's `find`).
@@ -487,6 +525,22 @@ mod tests {
         let newer = Entry { version: "0.2".into(), ..gone };
         assert_eq!(store.status(BoardId::Fm1, &newer, &locals), Status::Update("0.2".into()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// genkigenki's site names all his firmwares and drops old versions: a gone package is
+    /// followed to its own newest file, in its own variant.
+    #[test]
+    fn a_gone_package_is_followed_to_its_newer_version() {
+        let names: Vec<String> = ["firmware/amb-1.1-elite.fwsc", "firmware/makkuro37-0.3-elite.fwsc", "firmware/makkuro37-0.3-mke.fwsc",
+            "firmware/makkuro37-0.3.fwsc", "firmware/makkuro37-0.10.fwsc", "firmware/makkuro37x-0.9.fwsc", "firmware/vector37-0.3.2-fm1.fwsc"]
+            .iter().map(|s| s.to_string()).collect();
+        let (stem, var) = stem_variant("https://x/firmware/makkuro37-0.1.fwsc").unwrap();
+        assert_eq!((stem.as_str(), var.as_str()), ("makkuro37", ""));
+        let got = successors(&names, &stem, &var);
+        assert_eq!(got, vec![("firmware/makkuro37-0.10.fwsc".to_string(), Some("0.10".to_string())), ("firmware/makkuro37-0.3.fwsc".to_string(), Some("0.3".to_string()))]);
+        let (stem, var) = stem_variant("https://x/firmware/makkuro37-0.1-mke.fwsc").unwrap();
+        assert_eq!(successors(&names, &stem, &var)[0].0, "firmware/makkuro37-0.3-mke.fwsc");
+        assert_eq!(stem_variant("https://x/f/choralroot-0.24-beta3-elite.fwsc").unwrap(), ("choralroot".into(), "-elite".into()));
     }
 
     #[test]
