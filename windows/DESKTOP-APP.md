@@ -6,7 +6,10 @@ from upstream with the built-in ones as fallback, flash saved per firmware, wind
 each board's panel. 0.2 (24 Oct, a friend's requests): the computer keyboard in Ableton or
 FL / tracker layout with its letters on the keys; the Library strip (F2), Kontakt-like: both
 boards as pictures, the firmwares here as tiles of their screens (the playing one live), the
-last played first. Still to do: the app's own update check, and the "big screen" layout.
+last played first. 0.3 (24 Oct): colour themes from the real units' colourways (Classic =
+upstream's own drawing; Black, Graphite, Orange, Mint, Cream), per board, in `skin.rs`, which
+repaints upstream's panels in a theme's colours with the same geometry; the FM-1's keybed swap,
+pills or a piano keyboard (F3..G5) in the same groove. Still to do: the app's own update check, and the "big screen" layout.
 
 The goal: one Windows `.exe` for both boards, with no Node.js and no console. The emulator is already one
 program for both: a package says which board it runs on, and the panel follows it.

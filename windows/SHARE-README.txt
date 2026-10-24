@@ -54,6 +54,13 @@ The computer keyboard plays it as well, in one of two layouts (Settings, bottom 
   F2    the Library: both synths and your firmwares as pictures of their screens,
         the last played first; one click switches
 
+LOOKS (bottom right of the window)
+
+  🎨  the colours: Classic (the emulator's own), or as the real units come:
+      Black, Graphite, Orange, Mint, Cream. Each synth keeps its own.
+  💊 / 🎹  (FM-1) swaps its keybed: the unit's pill keys, or a piano keyboard
+      in the same groove. Same notes, same keys on the computer keyboard.
+
 What each button does is up to the firmware: its "source" link in the list leads to
 its page, which usually has a manual.
 

@@ -4,6 +4,7 @@
 use crate::catalog::{BoardId, Catalog, Entry, Local, Source, Status, Store};
 use crate::engine::{self, Audio, Midi, Session};
 use crate::keys::{self, Layout};
+use crate::skin::{self, Keybed, Theme};
 use crate::{panel, panel_smk};
 use eframe::egui::{self, Color32, Key, RichText};
 use fm1_soc::Action;
@@ -41,11 +42,15 @@ struct Settings {
     library: bool,
     /// firmwares played, the last first ("<board>/<id>")
     recent: Vec<String>,
+    /// each board's colours, and the FM-1's keybed (pills or a piano keyboard)
+    theme_fm1: Theme,
+    theme_smk: Theme,
+    keybed: Keybed,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { board: BoardId::Fm1, last: BTreeMap::new(), own: BTreeMap::new(), mhz: 240, midi: "all".into(), keys: Layout::Ableton, hints: false, library: false, recent: Vec::new() }
+        Settings { board: BoardId::Fm1, last: BTreeMap::new(), own: BTreeMap::new(), mhz: 240, midi: "all".into(), keys: Layout::Ableton, hints: false, library: false, recent: Vec::new(), theme_fm1: Theme::Classic, theme_smk: Theme::Classic, keybed: Keybed::Pills }
     }
 }
 
@@ -436,6 +441,7 @@ impl Desk {
     /// fm1-live's FM-1 window loop, one frame.
     fn fm1_frame(&mut self, f: &Frame) {
         let layout = self.settings.keys;
+        let kb = self.settings.keybed;
         let (Some(r), Input::Fm1(s)) = (&self.running, &mut self.input) else { return };
         let send = |a: Action| r.session.send(a);
         let turn = |s: &mut Fm1Input, i: usize, clicks: i32| {
@@ -445,19 +451,19 @@ impl Desk {
         };
         if let Some((mx, my)) = f.pointer {
             if f.down && !f.was_down {
-                s.grab = panel::hit(mx, my);
+                s.grab = skin::fm1_hit(kb, mx, my);
                 s.last_y = my;
                 s.drag_acc = 0.0;
                 if let Some(panel::Ctl::Key(k)) = s.grab {
-                    s.mouse_vel = panel::key_vel(k, my);
+                    s.mouse_vel = skin::fm1_key_vel(kb, k, my);
                 }
             } else if f.down {
                 match s.grab {
                     // glissando: the held note follows the pointer across keys; on the same key,
                     // its height is the pressure (aftertouch)
                     Some(panel::Ctl::Key(k0)) => {
-                        if let Some(panel::Ctl::Key(k)) = panel::hit(mx, my) {
-                            let v = panel::key_vel(k, my);
+                        if let Some(panel::Ctl::Key(k)) = skin::fm1_hit(kb, mx, my) {
+                            let v = skin::fm1_key_vel(kb, k, my);
                             if k != k0 {
                                 s.grab = Some(panel::Ctl::Key(k));
                                 s.mouse_vel = v;
@@ -491,7 +497,7 @@ impl Desk {
                 s.last_y = my;
             }
             if f.scroll != 0.0 {
-                match panel::hit(mx, my) {
+                match skin::fm1_hit(kb, mx, my) {
                     Some(panel::Ctl::Enc(i)) => {
                         s.scroll_acc[i] += f.scroll;
                         while s.scroll_acc[i] >= 1.0 {
@@ -685,7 +691,8 @@ impl Desk {
                     s.shown_leds[i] = leds[i].max(s.shown_leds[i] * 0.8);
                 }
                 let st = panel::State { lcd: &self.fb, enc_clicks: &s.enc_clicks, pot: s.pot, down: &s.down, leds: &s.shown_leds, turning: &s.turning };
-                panel::draw(&mut self.buf, base_fm1(), &st);
+                let (t, k) = (self.settings.theme_fm1, self.settings.keybed);
+                skin::fm1_draw(&mut self.buf, base_fm1(t, k), &st, t, k);
             }
             Input::Smk(s) => {
                 use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH};
@@ -702,7 +709,8 @@ impl Desk {
                     pitch: s.analog[ANALOG_PITCH as usize],
                     modw: s.analog[ANALOG_MOD as usize],
                 };
-                panel_smk::draw(&mut self.buf, base_smk(), &st);
+                let t = self.settings.theme_smk;
+                skin::smk_draw(&mut self.buf, base_smk(t), &st, t);
             }
         }
         self.upload(ctx, w, h);
@@ -927,11 +935,55 @@ impl Desk {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button(RichText::new("⚙  Settings").size(15.0), |ui| self.settings_menu(ui));
+                self.look_controls(ui);
                 if self.settings.hints {
                     ui.label(RichText::new(format!("keys: {}", self.settings.keys.name())).weak());
                 }
             });
         });
+    }
+
+    /// The colours of the board on show, and (FM-1) the keybed swap: pills or a piano keyboard.
+    fn look_controls(&mut self, ui: &mut egui::Ui) {
+        let smk = matches!(self.input, Input::Smk(_));
+        let cur = if smk { self.settings.theme_smk } else { self.settings.theme_fm1 };
+        let mut pick = cur;
+        ui.menu_button(RichText::new(format!("🎨  {}", cur.short())).size(15.0), |ui| {
+            ui.set_min_width(220.0);
+            ui.label(RichText::new(format!("{} colours", if smk { "SMK-37" } else { "FM-1" })).strong());
+            for t in Theme::ALL {
+                ui.horizontal(|ui| {
+                    let (body, keys) = t.swatch();
+                    let c = |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8);
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::hover());
+                    ui.painter().rect_filled(r, 4.0, c(body));
+                    ui.painter().rect_filled(egui::Rect::from_min_size(r.min + egui::vec2(18.0, 4.0), egui::vec2(12.0, 10.0)), 3.0, c(keys));
+                    if ui.radio_value(&mut pick, t, t.name()).clicked() {
+                        ui.close_menu();
+                    }
+                });
+            }
+            ui.label(RichText::new("The real units come in these colours.").size(12.5).weak());
+        });
+        if pick != cur {
+            if smk {
+                self.settings.theme_smk = pick;
+            } else {
+                self.settings.theme_fm1 = pick;
+            }
+            self.board_tex.clear();
+            self.settings.save(&self.store);
+        }
+        if !smk {
+            let piano = self.settings.keybed == Keybed::Piano;
+            let label = if piano { "🎹  Piano keys" } else { "💊  Pill keys" };
+            if ui.button(RichText::new(label).size(15.0)).on_hover_text("Swap the FM-1's keybed: its pill keys, or a piano keyboard in the same groove").clicked() {
+                self.release_all();
+                self.settings.keybed = if piano { Keybed::Pills } else { Keybed::Piano };
+                self.board_tex.clear();
+                self.settings.save(&self.store);
+            }
+        }
     }
 
     /// Clock, MIDI input, the computer keyboard's layout and its letters on the keys.
@@ -1044,7 +1096,7 @@ impl Desk {
         let smk = matches!(self.input, Input::Smk(_));
         let s = rect.width() / w as f32;
         let _ = h; // (the panel keeps its aspect: one scale for both)
-        let list = if smk { panel_smk::keys() } else { panel::keys() };
+        let list = if smk { panel_smk::keys() } else { skin::fm1_keys(self.settings.keybed) };
         let font = egui::FontId::monospace((15.0 * s * if smk { 1.2 } else { 1.4 }).max(9.0));
         for (id, x, y, kw, kh, black) in list {
             let t = keys::label(self.settings.keys, smk, id);
@@ -1113,7 +1165,8 @@ impl Desk {
                         BoardId::Fm1 => {
                             let mut buf = vec![0u32; panel::W * panel::H];
                             let st = panel::State { lcd: &lcd, enc_clicks: &[0; 7], pot: 600, down: &[false; 41], leds: &[0.0; 41], turning: &[0; 8] };
-                            panel::draw(&mut buf, base_fm1(), &st);
+                            let (t, k) = (self.settings.theme_fm1, self.settings.keybed);
+                            skin::fm1_draw(&mut buf, base_fm1(t, k), &st, t, k);
                             (panel::W, panel::H, buf)
                         }
                         BoardId::Smk37 => {
@@ -1131,7 +1184,8 @@ impl Desk {
                                 pitch: PITCH_REST,
                                 modw: MOD_REST,
                             };
-                            panel_smk::draw(&mut buf, base_smk(), &st);
+                            let t = self.settings.theme_smk;
+                            skin::smk_draw(&mut buf, base_smk(t), &st, t);
                             (panel_smk::W, panel_smk::H, buf)
                         }
                     };
@@ -1230,14 +1284,17 @@ impl Desk {
 }
 
 
-fn base_fm1() -> &'static [u32] {
-    static B: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    B.get_or_init(panel::base)
+/// A panel's still parts, drawn once per theme (and keybed) and kept.
+fn base_fm1(t: Theme, k: Keybed) -> &'static [u32] {
+    static B: std::sync::Mutex<Option<HashMap<(Theme, Keybed), &'static [u32]>>> = std::sync::Mutex::new(None);
+    let mut m = B.lock().unwrap();
+    m.get_or_insert_with(HashMap::new).entry((t, k)).or_insert_with(|| skin::fm1_base(t, k).leak())
 }
 
-fn base_smk() -> &'static [u32] {
-    static B: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    B.get_or_init(panel_smk::base)
+fn base_smk(t: Theme) -> &'static [u32] {
+    static B: std::sync::Mutex<Option<HashMap<Theme, &'static [u32]>>> = std::sync::Mutex::new(None);
+    let mut m = B.lock().unwrap();
+    m.get_or_insert_with(HashMap::new).entry(t).or_insert_with(|| skin::smk_base(t).leak())
 }
 
 impl eframe::App for Desk {

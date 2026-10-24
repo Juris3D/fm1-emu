@@ -17,6 +17,7 @@ mod app;
 mod catalog;
 mod engine;
 mod keys;
+mod skin;
 
 fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--version" || a == "-V") {

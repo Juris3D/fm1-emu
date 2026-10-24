@@ -39,6 +39,10 @@ That is the Ableton layout; ⚙ Settings also has the FL Studio / tracker one (Z
 Q W E R …, two octaves; - / = octave, Enter REC, F3…F12 buttons / pads) and shows the letters
 on the panel's keys.
 
+Bottom right, 🎨 picks the colours (Classic, or the real units' Black, Graphite, Orange, Mint,
+Cream; each synth its own), and on the FM-1 the 💊 / 🎹 button swaps its keybed: pill keys or a
+piano keyboard in the same groove.
+
 The mouse works on the drawn panel: click or drag across keys, drag or scroll knobs, drag faders
 and wheels. Any MIDI keyboard plays it. If the sound crackles, the CPU can't keep up: lower the
 clock in the bottom bar (try 160, then 120).
