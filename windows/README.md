@@ -43,6 +43,11 @@ Bottom right, 🎨 picks the colours (Classic, or the real units' Black, Graphit
 Cream; each synth its own), and on the FM-1 the 💊 / 🎹 button swaps its keybed: pill keys or a
 piano keyboard in the same groove.
 
+🎤 Sampler (bottom bar): an add-on of this app, not part of either synth. Record from the
+microphone / line in or resample the synth, or load a WAV; play it from the keys and MIDI (Keys
+play: Synth / Sampler / Both); SK-1 grit (8-bit, 9.4 kHz) or clean; memory 1.4 s like the SK-1,
+or longer.
+
 The mouse works on the drawn panel: click or drag across keys, drag or scroll knobs, drag faders
 and wheels. Any MIDI keyboard plays it. If the sound crackles, the CPU can't keep up: lower the
 clock in the bottom bar (try 160, then 120).

@@ -61,6 +61,22 @@ LOOKS (bottom right of the window)
   💊 / 🎹  (FM-1) swaps its keybed: the unit's pill keys, or a piano keyboard
       in the same groove. Same notes, same keys on the computer keyboard.
 
+THE SAMPLER (🎤 in the bottom bar)
+
+An add-on of this app, not part of the FM-1 or SMK-37: a little 80s sampling keyboard
+beside the synth, in the spirit of the Casio SK-1 and Yamaha's VSS samplers.
+
+  REC          records from the microphone / line in, or from the synth itself
+               ("resample"); with "start when sound comes" it waits for sound
+  Load / Save  WAV files; the sound is also kept for next time
+  Length       the memory: 1.4 s as the SK-1 had, or (the cheat) 3 s ... 2 min
+  SK-1 grit    8-bit, 9,380 samples a second, nothing filtering: grainy and metallic,
+               as those keyboards sounded. Or Clean.
+  Loop, Reverse, Octave, Release, Volume
+  Keys play    Synth / Sampler / Both: the panel's keys, the computer keyboard and MIDI
+               notes. The sound plays at its own pitch on C4; higher keys play it faster
+               and shorter, lower keys slower and longer, as on tape.
+
 What each button does is up to the firmware: its "source" link in the list leads to
 its page, which usually has a manual.
 

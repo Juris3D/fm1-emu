@@ -3,6 +3,7 @@
 //! and the MIDI inputs live for the whole app; a session plugs into them while it runs. The
 //! flash is kept per firmware: restored at start, written back when the session stops.
 
+use crate::sampler::Sampler;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fm1_core::{Bus, Cpu};
 use fm1_soc::{machine, Action, Board, Soc};
@@ -44,9 +45,10 @@ pub struct Audio {
 }
 
 impl Audio {
-    pub fn open() -> Audio {
+    /// The output, with the Sampler mixed in (and listening, when it resamples the synth).
+    pub fn open(sampler: Sampler) -> Audio {
         let ring = Arc::new(AudioRing { q: Mutex::new(VecDeque::new()), started: AtomicBool::new(false), underruns: AtomicU64::new(0) });
-        match start_audio(ring.clone()) {
+        match start_audio(ring.clone(), sampler) {
             Ok(s) => Audio { ring, _stream: Some(s), error: None },
             Err(e) => Audio { ring, _stream: None, error: Some(e) },
         }
@@ -56,7 +58,7 @@ impl Audio {
     }
 }
 
-fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
+fn start_audio(ring: Arc<AudioRing>, sampler: Sampler) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let dev = host.default_output_device().ok_or("no audio output device")?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
@@ -65,6 +67,7 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
     }
     let channels = cfg.channels() as usize;
     let step = 44_100.0 / cfg.sample_rate().0 as f64; // source frames per output frame
+    sampler.set_out_rate(cfg.sample_rate().0 as f32);
     let (mut pos, mut cur, mut next) = (0.0f64, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
     let stream = dev
         .build_output_stream(
@@ -91,6 +94,8 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
                         *s = if c % 2 == 0 { l } else { r };
                     }
                 }
+                drop(q);
+                sampler.mix_frames(out, channels);
                 if starved && ring.started.load(Ordering::Relaxed) {
                     ring.underruns.fetch_add(1, Ordering::Relaxed);
                 }
@@ -107,6 +112,7 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
 
 /// The MIDI inputs: their bytes go to the running session's MIDI IN jack (none running: dropped).
 pub struct Midi {
+    sampler: Sampler,
     target: Arc<Mutex<Option<mpsc::Sender<Action>>>>,
     conns: Vec<midir::MidiInputConnection<()>>,
     pub names: Vec<String>,
@@ -115,8 +121,8 @@ pub struct Midi {
 }
 
 impl Midi {
-    pub fn new() -> Midi {
-        Midi { target: Arc::new(Mutex::new(None)), conns: Vec::new(), names: Vec::new(), choice: String::new() }
+    pub fn new(sampler: Sampler) -> Midi {
+        Midi { sampler, target: Arc::new(Mutex::new(None)), conns: Vec::new(), names: Vec::new(), choice: String::new() }
     }
 
     /// The inputs there are now (for the menu).
@@ -141,8 +147,12 @@ impl Midi {
             }
             let Ok(mut input) = midir::MidiInput::new("fm1-desk") else { continue };
             input.ignore(midir::Ignore::None);
-            let target = self.target.clone();
+            let (target, sampler) = (self.target.clone(), self.sampler.clone());
             let got = input.connect(&port, "fm1-desk in", move |_, msg, _| {
+                // (the Sampler takes the notes it plays; the rest goes on to the synth)
+                if !sampler.midi(msg) {
+                    return;
+                }
                 if let Some(tx) = target.lock().unwrap().as_ref() {
                     for &b in msg {
                         let _ = tx.send(Action::Midi { b });

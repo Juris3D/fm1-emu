@@ -4,6 +4,7 @@
 use crate::catalog::{BoardId, Catalog, Entry, Local, Source, Status, Store};
 use crate::engine::{self, Audio, Midi, Session};
 use crate::keys::{self, Layout};
+use crate::sampler::{self, Route, Sampler};
 use crate::skin::{self, Keybed, Theme};
 use crate::{panel, panel_smk};
 use eframe::egui::{self, Color32, Key, RichText};
@@ -11,7 +12,7 @@ use fm1_soc::Action;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 pub const TITLE: &str = "FM-1 · SMK-37 Desk";
@@ -22,6 +23,8 @@ const NOTCH: f32 = 50.0;
 const CLOCKS: [u64; 5] = [240, 200, 160, 120, 96];
 /// The Library strip's width.
 const LIBRARY_W: f32 = 236.0;
+/// The Sampler panel's width.
+const SAMPLER_W: f32 = 300.0;
 
 // ------------------------------------------------------------------ settings
 
@@ -46,11 +49,14 @@ struct Settings {
     theme_fm1: Theme,
     theme_smk: Theme,
     keybed: Keybed,
+    /// the Sampler add-on: its panel shown, and its settings
+    sampler_open: bool,
+    sampler: sampler::Params,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { board: BoardId::Fm1, last: BTreeMap::new(), own: BTreeMap::new(), mhz: 240, midi: "all".into(), keys: Layout::Ableton, hints: false, library: false, recent: Vec::new(), theme_fm1: Theme::Classic, theme_smk: Theme::Classic, keybed: Keybed::Pills }
+        Settings { board: BoardId::Fm1, last: BTreeMap::new(), own: BTreeMap::new(), mhz: 240, midi: "all".into(), keys: Layout::Ableton, hints: false, library: false, recent: Vec::new(), theme_fm1: Theme::Classic, theme_smk: Theme::Classic, keybed: Keybed::Pills, sampler_open: false, sampler: sampler::Params::default() }
     }
 }
 
@@ -185,6 +191,11 @@ pub struct Desk {
     thumbs: HashMap<String, Option<egui::TextureHandle>>,
     live_tex: Option<egui::TextureHandle>,
     live_at: Instant,
+    // the Sampler
+    sampler: Sampler,
+    mic: Option<cpal::Stream>,
+    /// the sound's outline for the display: (which sound, grit, min / max per column)
+    wave: Option<(usize, bool, Vec<(f32, f32)>)>,
 }
 
 impl Desk {
@@ -197,8 +208,15 @@ impl Desk {
 
         let store = Store::here();
         let settings = Settings::load(&store);
-        let audio = Audio::open();
-        let mut midi = Midi::new();
+        let sampler = Sampler::new(settings.sampler.clone());
+        // the sound the Sampler held last time
+        if let Ok((raw, rate)) = std::fs::read(sampler_wav(&store)).map_err(|e| e.to_string()).and_then(|b| sampler::read_wav(&b)) {
+            if !raw.is_empty() {
+                sampler.set_sample(Some(sampler::Sample::new(raw, rate)));
+            }
+        }
+        let audio = Audio::open(sampler.clone());
+        let mut midi = Midi::new(sampler.clone());
         midi.connect(&settings.midi);
         let (jobs_tx, jobs_rx) = mpsc::channel();
         let mut lists = HashMap::new();
@@ -240,6 +258,9 @@ impl Desk {
             thumbs: HashMap::new(),
             live_tex: None,
             live_at: Instant::now(),
+            sampler,
+            mic: None,
+            wave: None,
         };
         if let Some(e) = desk.audio.error.clone() {
             desk.say(format!("no sound: {e}"));
@@ -443,7 +464,13 @@ impl Desk {
         let layout = self.settings.keys;
         let kb = self.settings.keybed;
         let (Some(r), Input::Fm1(s)) = (&self.running, &mut self.input) else { return };
-        let send = |a: Action| r.session.send(a);
+        let smp = &self.sampler;
+        // (the Sampler plays the notes, as its "keys play" says)
+        let send = |a: Action| {
+            if smp.route(false, &a) {
+                r.session.send(a)
+            }
+        };
         let turn = |s: &mut Fm1Input, i: usize, clicks: i32| {
             s.enc_clicks[i] += clicks;
             s.turning[i] = 10;
@@ -557,7 +584,12 @@ impl Desk {
         use panel_smk::Ctl as S;
         let layout = self.settings.keys;
         let (Some(r), Input::Smk(s)) = (&self.running, &mut self.input) else { return };
-        let send = |a: Action| r.session.send(a);
+        let smp = &self.sampler;
+        let send = |a: Action| {
+            if smp.route(true, &a) {
+                r.session.send(a)
+            }
+        };
         let set_analog = |s: &mut SmkInput, i: usize, v: u16| {
             if s.analog[i] != v {
                 s.analog[i] = v;
@@ -921,6 +953,11 @@ impl Desk {
             if ui.selectable_label(self.settings.library, RichText::new("▤  Library  (F2)").size(15.0)).clicked() {
                 self.toggle_library();
             }
+            if ui.selectable_label(self.settings.sampler_open, RichText::new("🎤  Sampler").size(15.0)).on_hover_text("A sampling keyboard beside the synth (an add-on of this app)").clicked() {
+                self.settings.sampler_open = !self.settings.sampler_open;
+                self.settings.save(&self.store);
+                self.fit_window_wider(self.settings.sampler_open, SAMPLER_W);
+            }
             if let Some(r) = &self.running {
                 ui.label(RichText::new(format!("{}  ·  {} {}", r.board.name(), r.name, r.version)).strong());
                 let s = r.session.shared.stats.lock().unwrap().clone();
@@ -1049,13 +1086,14 @@ impl Desk {
     fn fit_window(&self) {
         let (w, h) = self.panel_size();
         let width = self.ctx.input(|i| i.viewport().inner_rect.map(|r| r.width())).unwrap_or(1280.0);
-        let strip = if self.settings.library { LIBRARY_W } else { 0.0 };
+        let strip = if self.settings.library { LIBRARY_W } else { 0.0 } + if self.settings.sampler_open { SAMPLER_W } else { 0.0 };
         let height = ((width - strip).max(320.0) * h as f32 / w as f32 + 38.0).round();
         self.ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
     }
 
     /// Let go of every key, button and pad the window holds (the picker takes the keyboard).
     fn release_all(&mut self) {
+        self.sampler.all_off();
         let Some(r) = &self.running else { return };
         match &mut self.input {
             Input::Fm1(s) => {
@@ -1083,6 +1121,218 @@ impl Desk {
                 s.grab = None;
             }
         }
+    }
+
+    /// The window wider (or narrower) by a panel's width, the synth's panel keeping its size.
+    fn fit_window_wider(&self, open: bool, w: f32) {
+        let size = self.ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::vec2(1280.0, 858.0));
+        let width = if open { size.x + w } else { (size.x - w).max(480.0) };
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, size.y)));
+    }
+
+    // -------------------------------------------------------------- the Sampler
+
+    /// A finished recording is kept on disk; the input device closes when it is done.
+    fn sampler_poll(&mut self) {
+        if self.sampler.take_fresh() {
+            self.save_sample();
+        }
+        if self.mic.is_some() && !self.sampler.recording() {
+            self.mic = None;
+        }
+    }
+
+    fn save_sample(&mut self) {
+        if let Some(s) = self.sampler.sample() {
+            if let Err(e) = sampler::write_wav(&sampler_wav(&self.store), &s.raw, s.rate) {
+                self.say(format!("the sample could not be kept: {e}"));
+            }
+        } else {
+            let _ = std::fs::remove_file(sampler_wav(&self.store));
+        }
+    }
+
+    fn set_sampler(&mut self, p: sampler::Params) {
+        if p != self.settings.sampler {
+            if p.route != self.settings.sampler.route {
+                self.release_all();
+            }
+            self.sampler.set_params(&p);
+            self.settings.sampler = p;
+            self.settings.save(&self.store);
+        }
+    }
+
+    /// The Sampler's panel: a display of the sound, recording, the memory, the sound's character,
+    /// and what the keys play.
+    fn sampler_ui(&mut self, ui: &mut egui::Ui) {
+        let mut p = self.settings.sampler.clone();
+        let rec = self.sampler.rec_state();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sampler").size(20.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✖").on_hover_text("Close the Sampler").clicked() {
+                    self.settings.sampler_open = false;
+                    self.settings.save(&self.store);
+                    self.fit_window_wider(false, SAMPLER_W);
+                }
+            });
+        });
+        ui.label(RichText::new("An add-on of this app, in the spirit of 80s sampling keyboards; not part of the FM-1 or SMK-37.").size(12.0).weak());
+        ui.add_space(6.0);
+
+        // the display: a green LCD with the sound's outline, the voices' places, the memory
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 104.0), egui::Sense::hover());
+        let pt = ui.painter_at(rect);
+        let (lcd, ink, dim) = (Color32::from_rgb(150, 168, 120), Color32::from_rgb(28, 36, 24), Color32::from_rgb(118, 135, 94));
+        pt.rect_filled(rect, 6.0, Color32::from_rgb(20, 21, 24));
+        let screen = rect.shrink(5.0);
+        pt.rect_filled(screen, 3.0, lcd);
+        let cols = screen.width() as usize;
+        let mid = screen.center().y;
+        let half = screen.height() * 0.40;
+        let sample = self.sampler.sample();
+        let font = egui::FontId::monospace(12.0);
+        if let Some((waiting, secs, max)) = rec {
+            let t = if waiting { "WAITING FOR SOUND…".to_string() } else { format!("REC  {secs:.1} / {max:.1} s") };
+            pt.text(screen.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, t, font.clone(), ink);
+            let lv = self.sampler.level().min(1.0);
+            let bar = egui::Rect::from_min_size(egui::pos2(screen.left() + 6.0, mid - 6.0), egui::vec2((screen.width() - 12.0) * lv, 12.0));
+            pt.rect_filled(bar, 1.0, ink);
+            let done = egui::Rect::from_min_size(egui::pos2(screen.left() + 6.0, screen.bottom() - 12.0), egui::vec2((screen.width() - 12.0) * (secs / max).min(1.0), 5.0));
+            pt.rect_filled(done, 1.0, dim);
+        } else if let Some(s) = &sample {
+            let key = Arc::as_ptr(s) as usize;
+            if !matches!(&self.wave, Some((k, g, _)) if *k == key && *g == p.grit) {
+                let (data, _) = s.data(p.grit);
+                let per = (data.len() as f32 / cols.max(1) as f32).max(1.0);
+                let cols_v = (0..cols)
+                    .map(|c| {
+                        let (a, b) = ((c as f32 * per) as usize, (((c + 1) as f32 * per) as usize).min(data.len()));
+                        data.get(a..b.max(a + 1).min(data.len())).map_or((0.0, 0.0), |w| w.iter().fold((0.0f32, 0.0f32), |m, &x| (m.0.min(x), m.1.max(x))))
+                    })
+                    .collect();
+                self.wave = Some((key, p.grit, cols_v));
+            }
+            if let Some((_, _, w)) = &self.wave {
+                for (c, &(lo, hi)) in w.iter().enumerate() {
+                    let x = screen.left() + c as f32 + 0.5;
+                    let (lo, hi) = if p.reverse { w[w.len() - 1 - c] } else { (lo, hi) };
+                    pt.line_segment([egui::pos2(x, mid - hi * half), egui::pos2(x, mid - lo * half + 1.0)], egui::Stroke::new(1.0_f32, ink));
+                }
+            }
+            for f in self.sampler.playheads() {
+                let x = screen.left() + f.clamp(0.0, 1.0) * screen.width();
+                pt.line_segment([egui::pos2(x, screen.top()), egui::pos2(x, screen.bottom())], egui::Stroke::new(1.5_f32, Color32::from_rgb(180, 60, 40)));
+            }
+            let info = format!("{:.2} s   {}", s.seconds(), if p.grit { "8-BIT 9.4 kHz" } else { "CLEAN" });
+            pt.text(screen.left_top() + egui::vec2(6.0, 3.0), egui::Align2::LEFT_TOP, info, font.clone(), ink);
+        } else {
+            pt.text(screen.center(), egui::Align2::CENTER_CENTER, "EMPTY — RECORD OR LOAD", font.clone(), ink);
+        }
+        ui.add_space(8.0);
+
+        // recording
+        ui.horizontal(|ui| {
+            match rec {
+                None => {
+                    let b = egui::Button::new(RichText::new("🔴  REC").size(16.0).color(Color32::from_rgb(240, 90, 80))).min_size(egui::vec2(96.0, 30.0));
+                    if ui.add(b).clicked() {
+                        self.release_all();
+                        match self.sampler.record() {
+                            Ok(stream) => self.mic = stream,
+                            Err(e) => self.say(format!("Sampler: {e}")),
+                        }
+                    }
+                }
+                Some((waiting, _, _)) => {
+                    let b = egui::Button::new(RichText::new("⏹  STOP").size(16.0)).min_size(egui::vec2(96.0, 30.0));
+                    if ui.add(b).clicked() {
+                        if waiting { self.sampler.cancel() } else { self.sampler.stop() }
+                        self.mic = None;
+                    }
+                }
+            }
+            ui.vertical(|ui| {
+                ui.radio_value(&mut p.source, sampler::Source::Input, "microphone / line in");
+                ui.radio_value(&mut p.source, sampler::Source::Synth, "the synth (resample)");
+            });
+        });
+        ui.checkbox(&mut p.wait, "start when sound comes");
+        ui.horizontal(|ui| {
+            if ui.button("Load WAV…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().add_filter("WAV sound", &["wav"]).pick_file() {
+                    match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| sampler::read_wav(&b)) {
+                        Ok((mut raw, rate)) => {
+                            let max = (p.length * rate) as usize;
+                            if raw.len() > max {
+                                raw.truncate(max);
+                                self.say(format!("cut to {} s: the memory (Length) is that long", p.length));
+                            }
+                            self.sampler.set_sample(Some(sampler::Sample::new(raw, rate)));
+                            self.save_sample();
+                        }
+                        Err(e) => self.say(format!("{}: {e}", path.display())),
+                    }
+                }
+            }
+            if ui.add_enabled(sample.is_some(), egui::Button::new("Save WAV…")).on_hover_text("As recorded (clean), 16-bit").clicked() {
+                if let (Some(s), Some(path)) = (&sample, rfd::FileDialog::new().add_filter("WAV sound", &["wav"]).set_file_name("sample.wav").save_file()) {
+                    if let Err(e) = sampler::write_wav(&path, &s.raw, s.rate) {
+                        self.say(format!("{}: {e}", path.display()));
+                    }
+                }
+            }
+            if ui.add_enabled(sample.is_some(), egui::Button::new("Clear")).clicked() {
+                self.sampler.set_sample(None);
+                self.save_sample();
+            }
+        });
+        ui.separator();
+
+        // the memory, and the sound's character
+        ui.horizontal(|ui| {
+            ui.label("Length");
+            egui::ComboBox::from_id_salt("sampler-length")
+                .selected_text(sampler::LENGTHS.iter().find(|l| l.0 == p.length).map_or(format!("{} s", p.length), |l| l.1.to_string()))
+                .show_ui(ui, |ui| {
+                    for (v, name) in sampler::LENGTHS {
+                        ui.selectable_value(&mut p.length, v, name);
+                    }
+                });
+        });
+        ui.label(RichText::new("The SK-1 held 1.4 seconds; longer is the cheat. For the next recording or load.").size(12.0).weak());
+        ui.add_space(4.0);
+        ui.radio_value(&mut p.grit, true, "SK-1 grit: 8-bit, 9.4 kHz, unfiltered").on_hover_text("256 levels (quiet parts get grainy), 9,380 samples a second with nothing filtering the highs (they fold back down, metallic), each sample held until the next");
+        ui.radio_value(&mut p.grit, false, "Clean: as recorded");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.looped, "Loop");
+            ui.checkbox(&mut p.reverse, "Reverse");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Octave");
+            ui.add(egui::Slider::new(&mut p.octave, -2..=2));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Release");
+            ui.add(egui::Slider::new(&mut p.release, 0.01..=2.0).suffix(" s").logarithmic(true));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Volume");
+            ui.add(egui::Slider::new(&mut p.volume, 0.0..=1.0));
+        });
+        ui.label(RichText::new("The sound plays at its own pitch on C4; higher keys play it faster and shorter, lower ones slower and longer, as on tape.").size(12.0).weak());
+        ui.separator();
+
+        // what the keys play
+        ui.label(RichText::new("Keys play").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut p.route, Route::Synth, "Synth");
+            ui.selectable_value(&mut p.route, Route::Sampler, "Sampler");
+            ui.selectable_value(&mut p.route, Route::Both, "Both");
+        });
+        ui.label(RichText::new("The panel's keys, the computer keyboard and MIDI notes alike; buttons and knobs stay the synth's.").size(12.0).weak());
+        self.set_sampler(p);
     }
 
     fn toggle_library(&mut self) {
@@ -1284,6 +1534,11 @@ impl Desk {
 }
 
 
+/// Where the Sampler keeps its sound between runs.
+fn sampler_wav(store: &Store) -> PathBuf {
+    store.root.join("sampler").join("sample.wav")
+}
+
 /// A panel's still parts, drawn once per theme (and keybed) and kept.
 fn base_fm1(t: Theme, k: Keybed) -> &'static [u32] {
     static B: std::sync::Mutex<Option<HashMap<(Theme, Keybed), &'static [u32]>>> = std::sync::Mutex::new(None);
@@ -1320,6 +1575,9 @@ impl eframe::App for Desk {
             self.title = title;
         }
 
+        if !self.picker {
+            egui::TopBottomPanel::bottom("status").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 28)).inner_margin(egui::Margin::symmetric(10, 6))).show(ctx, |ui| self.status_bar(ui));
+        }
         if !self.picker && self.settings.library {
             egui::SidePanel::left("library")
                 .exact_width(LIBRARY_W)
@@ -1327,8 +1585,13 @@ impl eframe::App for Desk {
                 .frame(egui::Frame::new().fill(Color32::from_rgb(22, 23, 26)).inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ctx, |ui| self.library_ui(ui));
         }
-        if !self.picker {
-            egui::TopBottomPanel::bottom("status").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 28)).inner_margin(egui::Margin::symmetric(10, 6))).show(ctx, |ui| self.status_bar(ui));
+        self.sampler_poll();
+        if !self.picker && self.settings.sampler_open {
+            egui::SidePanel::right("sampler")
+                .exact_width(SAMPLER_W)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(Color32::from_rgb(30, 31, 35)).inner_margin(egui::Margin::symmetric(12, 10)))
+                .show(ctx, |ui| self.sampler_ui(ui));
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(16, 17, 19))).show(ctx, |ui| {
             let avail = ui.max_rect();

@@ -17,6 +17,7 @@ mod app;
 mod catalog;
 mod engine;
 mod keys;
+mod sampler;
 mod skin;
 
 fn main() -> eframe::Result {

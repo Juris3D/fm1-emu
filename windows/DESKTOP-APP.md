@@ -9,7 +9,11 @@ boards as pictures, the firmwares here as tiles of their screens (the playing on
 last played first. 0.3 (24 Oct): colour themes from the real units' colourways (Classic =
 upstream's own drawing; Black, Graphite, Orange, Mint, Cream), per board, in `skin.rs`, which
 repaints upstream's panels in a theme's colours with the same geometry; the FM-1's keybed swap,
-pills or a piano keyboard (F3..G5) in the same groove. Still to do: the app's own update check, and the "big screen" layout.
+pills or a piano keyboard (F3..G5) in the same groove. 0.4 (26 Oct): the Sampler (`sampler.rs`), a host-side add-on, SK-1 / VSS spirit, both
+boards: records the input or resamples the synth (tapped in the audio output), loads / saves
+WAV, plays from the note keys and MIDI as routed (Synth / Sampler / Both); SK-1 grit = 8-bit at
+9.38 kHz, no anti-alias, zero-order hold; memory 1.4 s (SK-1) or longer (the "cheat"). It is
+kept apart from the emulation: the firmware never sees it. Still to do: the app's own update check, and the "big screen" layout.
 
 The goal: one Windows `.exe` for both boards, with no Node.js and no console. The emulator is already one
 program for both: a package says which board it runs on, and the panel follows it.
